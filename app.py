@@ -17,7 +17,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-in-production'
+# 安全：从环境变量获取密钥，若无则使用默认（生产环境务必设置）
+app.secret_key = os.environ.get('SECRET_KEY', 'change-this-in-production')
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +27,7 @@ BACKUP_DIR = os.path.join(BASE_DIR, 'backups')
 if not os.path.exists(BACKUP_DIR):
     os.makedirs(BACKUP_DIR)
 
-# ---------- 数据库初始化（含动态迁移）---------
+# ---------- 数据库初始化 ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -76,7 +77,7 @@ def init_db():
         FOREIGN KEY (member_id) REFERENCES members (id)
     )''')
     
-    # 往来单位表（支持层级）
+    # 往来单位表
     c.execute('''CREATE TABLE IF NOT EXISTS partners (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -93,7 +94,7 @@ def init_db():
         FOREIGN KEY (parent_id) REFERENCES partners (id) ON DELETE SET NULL
     )''')
     
-    # 销售主表（增加 partner_id 和 payment_method 字符串）
+    # 销售主表
     c.execute('''CREATE TABLE IF NOT EXISTS sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sale_time TEXT NOT NULL,
@@ -102,6 +103,7 @@ def init_db():
         partner_id INTEGER DEFAULT NULL,
         payment_method TEXT DEFAULT 'cash',
         created_by INTEGER,
+        is_returned INTEGER DEFAULT 0,
         FOREIGN KEY (member_id) REFERENCES members (id),
         FOREIGN KEY (partner_id) REFERENCES partners (id),
         FOREIGN KEY (created_by) REFERENCES users (id)
@@ -119,7 +121,7 @@ def init_db():
         FOREIGN KEY (product_id) REFERENCES products (id)
     )''')
     
-    # 采购主表（增加 partner_id）
+    # 采购主表
     c.execute('''CREATE TABLE IF NOT EXISTS purchases (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         purchase_time TEXT NOT NULL,
@@ -129,6 +131,7 @@ def init_db():
         payment_method TEXT DEFAULT 'cash',
         payment_status TEXT DEFAULT 'paid',
         created_by INTEGER,
+        is_returned INTEGER DEFAULT 0,
         FOREIGN KEY (partner_id) REFERENCES partners (id),
         FOREIGN KEY (created_by) REFERENCES users (id)
     )''')
@@ -164,42 +167,80 @@ def init_db():
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     
-    # ---------- 动态迁移：为现有表增加缺失的列 ----------
-    # 为 partners 表增加 parent_id 和 level（如果不存在）
-    try:
-        c.execute("ALTER TABLE partners ADD COLUMN parent_id INTEGER")
-    except sqlite3.OperationalError:
-        pass  # 列已存在
-    try:
-        c.execute("ALTER TABLE partners ADD COLUMN level INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-    # 为 sales 表增加 partner_id（如果不存在）
-    try:
-        c.execute("ALTER TABLE sales ADD COLUMN partner_id INTEGER DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
-    # 为 purchases 表增加 partner_id（如果不存在）
-    try:
-        c.execute("ALTER TABLE purchases ADD COLUMN partner_id INTEGER DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
+    # 退货相关表
+    c.execute('''CREATE TABLE IF NOT EXISTS sales_returns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_time TEXT NOT NULL,
+        original_sale_id INTEGER NOT NULL,
+        total_amount REAL NOT NULL,
+        refund_amount REAL NOT NULL,
+        member_id INTEGER DEFAULT NULL,
+        partner_id INTEGER DEFAULT NULL,
+        payment_method TEXT DEFAULT 'cash',
+        reason TEXT,
+        created_by INTEGER,
+        FOREIGN KEY (original_sale_id) REFERENCES sales (id) ON DELETE RESTRICT,
+        FOREIGN KEY (member_id) REFERENCES members (id),
+        FOREIGN KEY (partner_id) REFERENCES partners (id),
+        FOREIGN KEY (created_by) REFERENCES users (id)
+    )''')
     
-    # ---------- 默认数据 ----------
-    # 默认管理员
+    c.execute('''CREATE TABLE IF NOT EXISTS sales_return_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        price_at_return REAL NOT NULL,
+        subtotal REAL NOT NULL,
+        FOREIGN KEY (return_id) REFERENCES sales_returns (id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products (id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS purchase_returns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_time TEXT NOT NULL,
+        original_purchase_id INTEGER NOT NULL,
+        total_amount REAL NOT NULL,
+        refund_amount REAL NOT NULL,
+        partner_id INTEGER DEFAULT NULL,
+        payment_method TEXT DEFAULT 'cash',
+        reason TEXT,
+        created_by INTEGER,
+        FOREIGN KEY (original_purchase_id) REFERENCES purchases (id) ON DELETE RESTRICT,
+        FOREIGN KEY (partner_id) REFERENCES partners (id),
+        FOREIGN KEY (created_by) REFERENCES users (id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS purchase_return_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_cost_at_return REAL NOT NULL,
+        subtotal REAL NOT NULL,
+        FOREIGN KEY (return_id) REFERENCES purchase_returns (id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products (id)
+    )''')
+    
+    # 动态迁移：为 sales 和 purchases 增加 is_returned 列
+    for tbl in ['sales', 'purchases']:
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN is_returned INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    
+    # 默认数据
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
     if c.fetchone()[0] == 0:
         admin_pw = generate_password_hash('admin123')
         c.execute("INSERT INTO users (username, password_hash, role, fullname) VALUES (?, ?, ?, ?)",
                   ('admin', admin_pw, 'admin', '系统管理员'))
     
-    # 示例商品
     c.execute("SELECT COUNT(*) FROM products")
     if c.fetchone()[0] == 0:
         sample = [('纯牛奶',3.5,2.5,100),('面包',5.0,3.0,50),('鸡蛋',1.2,0.8,200),('矿泉水',1.0,0.6,150),('薯片',7.5,4.5,80)]
         c.executemany("INSERT INTO products (name,price,cost,stock) VALUES (?,?,?,?)", sample)
     
-    # 示例会员
     c.execute("SELECT COUNT(*) FROM members")
     if c.fetchone()[0] == 0:
         today = date.today().isoformat()
@@ -211,7 +252,6 @@ def init_db():
         c.execute("INSERT INTO members (name,phone,card_type,balance,remaining_counts,valid_from,valid_to) VALUES (?,?,?,?,?,?,?)",
                   ('王五','13800003333','time_limited',0,0,today,next_month))
     
-    # 示例往来单位
     c.execute("SELECT COUNT(*) FROM partners")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO partners (name, type, contact_person, phone) VALUES (?,?,?,?)",
@@ -219,7 +259,6 @@ def init_db():
         c.execute("INSERT INTO partners (name, type, contact_person, phone) VALUES (?,?,?,?)",
                   ('天天客户','customer','李小姐','13833334444'))
     
-    # 支付方式默认配置
     c.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('payment_methods', '[\"现金\",\"银行转账\",\"微信\",\"支付宝\"]')")
     c.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('current_cash', '0')")
     c.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('current_bank', '0')")
@@ -291,13 +330,13 @@ def add_cash_flow(amount, flow_type, account_type, related_id, note, created_by)
     conn.commit()
     conn.close()
 
-# ---------- 支付方式辅助 ----------
 def get_payment_methods():
     methods_str = get_setting('payment_methods', '["现金","银行转账"]')
     try:
         return json.loads(methods_str)
     except:
         return ["现金", "银行转账"]
+
 # ---------- 页面路由 ----------
 @app.route('/')
 def index():
@@ -354,7 +393,6 @@ def backup_page():
 @role_required(['admin'])
 def useradmin():
     return render_template_string(USERADMIN_HTML)
-
 # ---------- 商品API ----------
 @app.route('/api/products', methods=['GET'])
 @login_required
@@ -519,6 +557,7 @@ def checkout():
     member_id = data.get('member_id')
     customer_id = data.get('customer_id')
     payment_method = data.get('payment_method', 'cash')
+    actual_amount = data.get('actual_amount')
     cart = session.get('cart', {})
     if not cart:
         return jsonify({'error': '购物车为空'}), 400
@@ -530,7 +569,7 @@ def checkout():
         total_amount = 0
         for pid_str, qty in cart.items():
             pid = int(pid_str)
-            c.execute("SELECT name, price, cost, stock FROM products WHERE id=? FOR UPDATE", (pid,))
+            c.execute("SELECT name, price, cost, stock FROM products WHERE id=?", (pid,))
             row = c.fetchone()
             if not row:
                 raise Exception(f"商品ID {pid} 不存在")
@@ -543,20 +582,27 @@ def checkout():
                 'price': row['price'], 'cost': row['cost']
             })
         
+        if actual_amount is None:
+            actual_amount = total_amount
+        else:
+            actual_amount = float(actual_amount)
+            if actual_amount < 0:
+                actual_amount = 0
+        
         # 会员支付处理
         if payment_method == 'member_card' and member_id:
-            c.execute("SELECT * FROM members WHERE id=? FOR UPDATE", (member_id,))
+            c.execute("SELECT * FROM members WHERE id=?", (member_id,))
             member = c.fetchone()
             if not member:
                 raise Exception("会员不存在")
             member = dict(member)
             if member['card_type'] == 'stored_value':
-                if member['balance'] < total_amount:
+                if member['balance'] < actual_amount:
                     raise Exception(f"储值卡余额不足，当前余额: {member['balance']}")
-                new_balance = member['balance'] - total_amount
+                new_balance = member['balance'] - actual_amount
                 c.execute("UPDATE members SET balance = ? WHERE id = ?", (new_balance, member_id))
                 c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
-                          (member_id, 'consume', -total_amount, f"消费 {total_amount} 元"))
+                          (member_id, 'consume', -actual_amount, f"消费 {actual_amount} 元"))
             elif member['card_type'] == 'count_limited':
                 if member['remaining_counts'] <= 0:
                     raise Exception("次卡剩余次数不足")
@@ -571,20 +617,20 @@ def checkout():
                 if member['valid_to'] and today_str > member['valid_to']:
                     raise Exception("会员卡已过期")
                 c.execute("INSERT INTO member_transactions (member_id, transaction_type, description) VALUES (?, ?, ?)",
-                          (member_id, 'consume', f"期限卡消费 {total_amount} 元"))
+                          (member_id, 'consume', f"期限卡消费 {actual_amount} 元"))
         
-        # 更新客户（往来单位）的应收余额
+        # 更新客户应收余额
         if customer_id:
-            c.execute("SELECT type, current_balance FROM partners WHERE id=? FOR UPDATE", (customer_id,))
+            c.execute("SELECT type, current_balance FROM partners WHERE id=?", (customer_id,))
             partner = c.fetchone()
             if partner and partner['type'] == 'customer':
-                new_bal = partner['current_balance'] + total_amount
+                new_bal = partner['current_balance'] + actual_amount
                 c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, customer_id))
         
         # 销售主表
         sale_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         c.execute("INSERT INTO sales (sale_time, total_amount, member_id, partner_id, payment_method, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                  (sale_time, total_amount, member_id, customer_id, payment_method, current_user.id))
+                  (sale_time, actual_amount, member_id, customer_id, payment_method, current_user.id))
         sale_id = c.lastrowid
         
         for item in items_to_buy:
@@ -592,14 +638,12 @@ def checkout():
                       (sale_id, item['id'], item['quantity'], item['price'], item['cost']))
             c.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['quantity'], item['id']))
         
-        # 现金流水
-        if payment_method not in ['member_card']:  # 会员卡支付不产生现金流水
-            add_cash_flow(total_amount, 'sales_income', 'cash', sale_id, f"销售单{sale_id}", current_user.id)
+        if payment_method != 'member_card':
+            add_cash_flow(actual_amount, 'sales_income', 'cash', sale_id, f"销售单{sale_id}", current_user.id)
         
         conn.commit()
         session['cart'] = {}
         
-        # 小票数据
         ticket_data = {
             'sale_id': sale_id,
             'sale_time': sale_time,
@@ -608,6 +652,7 @@ def checkout():
             'customer': None,
             'items': items_to_buy,
             'total': total_amount,
+            'actual': actual_amount,
             'payment_method': payment_method
         }
         if member_id:
@@ -616,7 +661,7 @@ def checkout():
             c.execute("SELECT name FROM partners WHERE id=?", (customer_id,))
             cust = c.fetchone()
             ticket_data['customer'] = cust['name'] if cust else ''
-        return jsonify({'message': '结算成功', 'sale_id': sale_id, 'total_amount': total_amount, 'ticket': ticket_data})
+        return jsonify({'message': '结算成功', 'sale_id': sale_id, 'total_amount': actual_amount, 'ticket': ticket_data})
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 400
@@ -675,7 +720,7 @@ def recharge_member(mid):
         return jsonify({'error':'充值金额或次数必须大于0'}),400
     conn,c = get_db()
     try:
-        c.execute("SELECT card_type,balance,remaining_counts FROM members WHERE id=? FOR UPDATE",(mid,))
+        c.execute("SELECT card_type,balance,remaining_counts FROM members WHERE id=?", (mid,))
         m = c.fetchone()
         if not m:
             return jsonify({'error':'会员不存在'}),404
@@ -684,7 +729,7 @@ def recharge_member(mid):
             if m['card_type']!='stored_value':
                 return jsonify({'error':'该会员不是储值卡'}),400
             new_bal = m['balance']+amount
-            c.execute("UPDATE members SET balance=? WHERE id=?",(new_bal,mid))
+            c.execute("UPDATE members SET balance=? WHERE id=?", (new_bal,mid))
             add_cash_flow(amount,'member_recharge','cash',mid,f"会员充值{amount}元",current_user.id)
             c.execute("INSERT INTO member_transactions (member_id,transaction_type,amount,description) VALUES (?,?,?,?)",
                       (mid,'recharge',amount,f"充值{amount}元"))
@@ -692,7 +737,7 @@ def recharge_member(mid):
             if m['card_type']!='count_limited':
                 return jsonify({'error':'该会员不是次卡'}),400
             new_cnt = m['remaining_counts']+counts
-            c.execute("UPDATE members SET remaining_counts=? WHERE id=?",(new_cnt,mid))
+            c.execute("UPDATE members SET remaining_counts=? WHERE id=?", (new_cnt,mid))
             c.execute("INSERT INTO member_transactions (member_id,transaction_type,counts_change,description) VALUES (?,?,?,?)",
                       (mid,'recharge',counts,f"充值{counts}次"))
         conn.commit()
@@ -711,6 +756,47 @@ def member_transactions(mid):
     rows = [dict(row) for row in c.fetchall()]
     conn.close()
     return jsonify(rows)
+
+# ---------- 会员充值冲销API ----------
+@app.route('/api/members/<int:mid>/recharge_reverse', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def reverse_member_recharge(mid):
+    data = request.get_json()
+    transaction_id = data.get('transaction_id')
+    amount = data.get('amount', 0)
+    reason = data.get('reason', '充值冲销')
+    if not transaction_id or amount <= 0:
+        return jsonify({'error': '参数错误'}), 400
+    conn, c = get_db()
+    try:
+        c.execute("BEGIN")
+        c.execute("SELECT transaction_type, amount FROM member_transactions WHERE id=? AND member_id=?", (transaction_id, mid))
+        trans = c.fetchone()
+        if not trans:
+            raise Exception("充值记录不存在")
+        if trans['transaction_type'] != 'recharge':
+            raise Exception("只能冲销充值记录")
+        if amount > trans['amount']:
+            raise Exception("冲销金额不能大于原充值金额")
+        c.execute("SELECT balance FROM members WHERE id=?", (mid,))
+        member = c.fetchone()
+        if not member:
+            raise Exception("会员不存在")
+        new_balance = member['balance'] - amount
+        if new_balance < 0:
+            raise Exception("会员余额不足，无法冲销")
+        c.execute("UPDATE members SET balance = ? WHERE id = ?", (new_balance, mid))
+        c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
+                  (mid, 'recharge_reverse', -amount, f"冲销充值：{reason}"))
+        add_cash_flow(-amount, 'member_recharge_reverse', 'cash', mid, f"会员充值冲销：{reason}", current_user.id)
+        conn.commit()
+        return jsonify({'message': '充值冲销成功'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 400
+    finally:
+        conn.close()
 
 # ---------- 用户管理API ----------
 @app.route('/api/users', methods=['GET'])
@@ -736,7 +822,7 @@ def add_user():
         return jsonify({'error':'参数错误'}),400
     conn,c = get_db()
     try:
-        c.execute("SELECT id FROM users WHERE username=?",(username,))
+        c.execute("SELECT id FROM users WHERE username=?", (username,))
         if c.fetchone():
             return jsonify({'error':'用户名已存在'}),400
         pw_hash = generate_password_hash(password)
@@ -758,7 +844,7 @@ def delete_user(uid):
         return jsonify({'error':'不能删除当前登录的管理员'}),400
     conn,c = get_db()
     try:
-        c.execute("DELETE FROM users WHERE id=?",(uid,))
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
         if c.rowcount==0:
             return jsonify({'error':'用户不存在'}),404
         conn.commit()
@@ -780,7 +866,7 @@ def reset_user_password(uid):
     conn,c = get_db()
     try:
         pw_hash = generate_password_hash(new_pw)
-        c.execute("UPDATE users SET password_hash=? WHERE id=?",(pw_hash,uid))
+        c.execute("UPDATE users SET password_hash=? WHERE id=?", (pw_hash,uid))
         conn.commit()
         return jsonify({'message':'密码重置成功'})
     except:
@@ -789,7 +875,7 @@ def reset_user_password(uid):
     finally:
         conn.close()
 
-# ---------- 往来单位API（支持层级）----------
+# ---------- 往来单位API ----------
 @app.route('/api/partners', methods=['GET'])
 @login_required
 def get_partners():
@@ -816,7 +902,6 @@ def add_partner():
         return jsonify({'error': '参数错误'}), 400
     conn, c = get_db()
     try:
-        # 计算层级
         level = 1
         if parent_id:
             c.execute("SELECT level FROM partners WHERE id=?", (parent_id,))
@@ -851,7 +936,6 @@ def update_partner(pid):
         return jsonify({'error': '参数错误'}), 400
     conn, c = get_db()
     try:
-        # 更新层级（简化，不递归更新子节点）
         level = 1
         if parent_id:
             c.execute("SELECT level FROM partners WHERE id=?", (parent_id,))
@@ -887,7 +971,7 @@ def delete_partner(pid):
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
-# ---------- 采购API（支持合作伙伴）----------
+# ---------- 采购API ----------
 @app.route('/api/purchases', methods=['POST'])
 @login_required
 @role_required(['admin'])
@@ -908,27 +992,23 @@ def create_purchase():
                      VALUES (?, ?, ?, ?, ?, ?, ?)""",
                   (pt, supplier, partner_id, total, payment_method, 'paid', current_user.id))
         pid = c.lastrowid
-        
-        # 更新供应商应付余额
         if partner_id:
-            c.execute("SELECT type, current_balance FROM partners WHERE id=? FOR UPDATE", (partner_id,))
+            c.execute("SELECT type, current_balance FROM partners WHERE id=?", (partner_id,))
             partner = c.fetchone()
             if partner and partner['type'] == 'supplier':
                 new_bal = partner['current_balance'] - total
                 c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, partner_id))
-        
         for it in items:
             product_id = it['product_id']
             qty = it['quantity']
             unit_cost = it['unit_cost']
             c.execute("INSERT INTO purchase_items (purchase_id, product_id, quantity, unit_cost) VALUES (?,?,?,?)",
                       (pid, product_id, qty, unit_cost))
-            c.execute("SELECT stock, cost FROM products WHERE id=? FOR UPDATE", (product_id,))
+            c.execute("SELECT stock, cost FROM products WHERE id=?", (product_id,))
             p = c.fetchone()
             new_stock = p['stock'] + qty
             new_cost = ((p['stock']*p['cost']) + (qty*unit_cost)) / new_stock if new_stock>0 else 0
             c.execute("UPDATE products SET stock=?, cost=? WHERE id=?", (new_stock, new_cost, product_id))
-        
         add_cash_flow(-total, 'purchase_payment', payment_method, pid, f"采购单{pid}", current_user.id)
         conn.commit()
         return jsonify({'id': pid, 'message': '采购入库成功'})
@@ -943,17 +1023,244 @@ def create_purchase():
 @role_required(['admin'])
 def get_purchases():
     conn,c = get_db()
-    c.execute("SELECT id,purchase_time,supplier,partner_id,total_amount,payment_method FROM purchases ORDER BY purchase_time DESC")
+    c.execute("SELECT id,purchase_time,supplier,partner_id,total_amount,payment_method,is_returned FROM purchases ORDER BY purchase_time DESC")
     rows = [dict(row) for row in c.fetchall()]
     conn.close()
     return jsonify(rows)
 
+# ---------- 销售退货API（修正版：自动判断原支付方式，支持次卡退次数）----------
+@app.route('/api/sales/<int:sale_id>/returnable_items', methods=['GET'])
+@login_required
+def get_returnable_items(sale_id):
+    conn, c = get_db()
+    c.execute("SELECT is_returned FROM sales WHERE id=?", (sale_id,))
+    sale = c.fetchone()
+    if not sale:
+        return jsonify({'error': '销售单不存在'}), 404
+    if sale['is_returned']:
+        return jsonify({'error': '该销售单已办理退货'}), 400
+    c.execute('''SELECT si.product_id, p.name, si.quantity as sold_qty, si.price_at_sale,
+                       COALESCE(SUM(sri.quantity), 0) as returned_qty
+                FROM sale_items si
+                JOIN products p ON si.product_id = p.id
+                LEFT JOIN sales_return_items sri ON sri.product_id = si.product_id
+                LEFT JOIN sales_returns sr ON sr.id = sri.return_id AND sr.original_sale_id = ?
+                WHERE si.sale_id = ?
+                GROUP BY si.product_id''', (sale_id, sale_id))
+    items = [dict(row) for row in c.fetchall()]
+    for item in items:
+        item['available_qty'] = item['sold_qty'] - item['returned_qty']
+    conn.close()
+    return jsonify(items)
+
+@app.route('/api/sales/return', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def process_sales_return():
+    data = request.get_json()
+    sale_id = data.get('original_sale_id')
+    items = data.get('items', [])
+    refund_amount = data.get('refund_amount')
+    reason = data.get('reason', '')
+    # 注意：不再需要前端传入 payment_method，后端自动根据原销售单处理
+    if not sale_id or not items:
+        return jsonify({'error': '参数错误'}), 400
+    conn, c = get_db()
+    try:
+        c.execute("BEGIN")
+        c.execute("SELECT total_amount, member_id, partner_id, payment_method, is_returned FROM sales WHERE id=?", (sale_id,))
+        sale = c.fetchone()
+        if not sale:
+            raise Exception("原销售单不存在")
+        if sale['is_returned']:
+            raise Exception("该销售单已退货")
+        sale = dict(sale)
+        total_refund = 0
+        return_items_detail = []
+        for it in items:
+            pid = it['product_id']
+            qty = it['quantity']
+            c.execute("SELECT price_at_sale, quantity FROM sale_items WHERE sale_id=? AND product_id=?", (sale_id, pid))
+            orig = c.fetchone()
+            if not orig:
+                raise Exception(f"商品ID {pid} 不在原销售单中")
+            c.execute("SELECT SUM(quantity) as total_returned FROM sales_return_items sri "
+                      "JOIN sales_returns sr ON sr.id = sri.return_id WHERE sr.original_sale_id=? AND sri.product_id=?", (sale_id, pid))
+            returned = c.fetchone()[0] or 0
+            if qty <= 0 or qty > (orig['quantity'] - returned):
+                raise Exception(f"商品 {pid} 退货数量超出可退数量")
+            subtotal = orig['price_at_sale'] * qty
+            total_refund += subtotal
+            return_items_detail.append({
+                'product_id': pid,
+                'quantity': qty,
+                'price': orig['price_at_sale'],
+                'subtotal': subtotal
+            })
+        if refund_amount is None or refund_amount <= 0:
+            refund_amount = total_refund
+        else:
+            refund_amount = min(refund_amount, total_refund)
+        # 增加库存
+        for it in return_items_detail:
+            c.execute("UPDATE products SET stock = stock + ? WHERE id = ?", (it['quantity'], it['product_id']))
+        # 根据原销售单的支付方式和会员信息处理退款/恢复
+        if sale['payment_method'] == 'member_card' and sale['member_id']:
+            c.execute("SELECT card_type, balance, remaining_counts FROM members WHERE id=?", (sale['member_id'],))
+            member = c.fetchone()
+            if not member:
+                raise Exception("会员不存在")
+            member = dict(member)
+            if member['card_type'] == 'stored_value':
+                new_bal = member['balance'] + refund_amount
+                c.execute("UPDATE members SET balance = ? WHERE id = ?", (new_bal, sale['member_id']))
+                c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
+                          (sale['member_id'], 'refund', refund_amount, f"销售退货退款，原单{sale_id}"))
+            elif member['card_type'] == 'count_limited':
+                # 次卡退货：恢复1次（根据原消费逻辑，每次销售扣1次）
+                new_counts = member['remaining_counts'] + 1
+                c.execute("UPDATE members SET remaining_counts = ? WHERE id = ?", (new_counts, sale['member_id']))
+                c.execute("INSERT INTO member_transactions (member_id, transaction_type, counts_change, description) VALUES (?, ?, ?, ?)",
+                          (sale['member_id'], 'refund', 1, f"销售退货恢复次数，原单{sale_id}"))
+            # 期限卡无需处理
+        else:
+            # 非会员卡支付，退现金
+            add_cash_flow(-refund_amount, 'sales_return', 'cash', sale_id, f"销售退货单{sale_id}", current_user.id)
+        # 更新客户应收余额（减少欠款）
+        if sale['partner_id']:
+            c.execute("SELECT current_balance FROM partners WHERE id=?", (sale['partner_id'],))
+            partner = c.fetchone()
+            if partner:
+                new_bal = partner['current_balance'] - refund_amount
+                c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, sale['partner_id']))
+        # 插入退货记录
+        return_time = datetime.now().isoformat()
+        c.execute("""INSERT INTO sales_returns (return_time, original_sale_id, total_amount, refund_amount, 
+                     member_id, partner_id, payment_method, reason, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (return_time, sale_id, total_refund, refund_amount, sale['member_id'], sale['partner_id'],
+                   sale['payment_method'], reason, current_user.id))
+        return_id = c.lastrowid
+        for it in return_items_detail:
+            c.execute("INSERT INTO sales_return_items (return_id, product_id, quantity, price_at_return, subtotal) VALUES (?, ?, ?, ?, ?)",
+                      (return_id, it['product_id'], it['quantity'], it['price'], it['subtotal']))
+        c.execute("UPDATE sales SET is_returned = 1 WHERE id = ?", (sale_id,))
+        conn.commit()
+        return jsonify({'message': '销售退货成功', 'return_id': return_id, 'refund_amount': refund_amount})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 400
+    finally:
+        conn.close()
+
+# ---------- 采购退货API ----------
+@app.route('/api/purchases/<int:purchase_id>/returnable_items', methods=['GET'])
+@login_required
+def get_purchase_returnable_items(purchase_id):
+    conn, c = get_db()
+    c.execute("SELECT is_returned FROM purchases WHERE id=?", (purchase_id,))
+    purchase = c.fetchone()
+    if not purchase:
+        return jsonify({'error': '采购单不存在'}), 404
+    if purchase['is_returned']:
+        return jsonify({'error': '该采购单已办理退货'}), 400
+    c.execute('''SELECT pi.product_id, p.name, pi.quantity as bought_qty, pi.unit_cost,
+                       COALESCE(SUM(puri.quantity), 0) as returned_qty
+                FROM purchase_items pi
+                JOIN products p ON pi.product_id = p.id
+                LEFT JOIN purchase_return_items puri ON puri.product_id = pi.product_id
+                LEFT JOIN purchase_returns pur ON pur.id = puri.return_id AND pur.original_purchase_id = ?
+                WHERE pi.purchase_id = ?
+                GROUP BY pi.product_id''', (purchase_id, purchase_id))
+    items = [dict(row) for row in c.fetchall()]
+    for item in items:
+        item['available_qty'] = item['bought_qty'] - item['returned_qty']
+    conn.close()
+    return jsonify(items)
+
+@app.route('/api/purchases/return', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def process_purchase_return():
+    data = request.get_json()
+    purchase_id = data.get('original_purchase_id')
+    items = data.get('items', [])
+    refund_amount = data.get('refund_amount')
+    reason = data.get('reason', '')
+    payment_method = data.get('payment_method', 'cash')
+    if not purchase_id or not items:
+        return jsonify({'error': '参数错误'}), 400
+    conn, c = get_db()
+    try:
+        c.execute("BEGIN")
+        c.execute("SELECT total_amount, partner_id, payment_method, is_returned FROM purchases WHERE id=?", (purchase_id,))
+        purchase = c.fetchone()
+        if not purchase:
+            raise Exception("采购单不存在")
+        if purchase['is_returned']:
+            raise Exception("该采购单已退货")
+        purchase = dict(purchase)
+        total_refund = 0
+        return_items_detail = []
+        for it in items:
+            pid = it['product_id']
+            qty = it['quantity']
+            c.execute("SELECT unit_cost, quantity FROM purchase_items WHERE purchase_id=? AND product_id=?", (purchase_id, pid))
+            orig = c.fetchone()
+            if not orig:
+                raise Exception(f"商品ID {pid} 不在原采购单中")
+            c.execute("SELECT SUM(quantity) as total_returned FROM purchase_return_items pri "
+                      "JOIN purchase_returns pr ON pr.id = pri.return_id WHERE pr.original_purchase_id=? AND pri.product_id=?", (purchase_id, pid))
+            returned = c.fetchone()[0] or 0
+            if qty <= 0 or qty > (orig['quantity'] - returned):
+                raise Exception(f"商品 {pid} 退货数量超出可退数量")
+            subtotal = orig['unit_cost'] * qty
+            total_refund += subtotal
+            return_items_detail.append({
+                'product_id': pid,
+                'quantity': qty,
+                'unit_cost': orig['unit_cost'],
+                'subtotal': subtotal
+            })
+        if refund_amount is None or refund_amount <= 0:
+            refund_amount = total_refund
+        else:
+            refund_amount = min(refund_amount, total_refund)
+        # 减少库存
+        for it in return_items_detail:
+            c.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (it['quantity'], it['product_id']))
+        # 退款（增加现金流）
+        add_cash_flow(refund_amount, 'purchase_return', payment_method, purchase_id, f"采购退货单{purchase_id}", current_user.id)
+        # 更新供应商应付余额（增加，因为退货减少了欠款）
+        if purchase['partner_id']:
+            c.execute("SELECT current_balance FROM partners WHERE id=?", (purchase['partner_id'],))
+            partner = c.fetchone()
+            if partner:
+                new_bal = partner['current_balance'] + refund_amount
+                c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, purchase['partner_id']))
+        return_time = datetime.now().isoformat()
+        c.execute("""INSERT INTO purchase_returns (return_time, original_purchase_id, total_amount, refund_amount,
+                     partner_id, payment_method, reason, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (return_time, purchase_id, total_refund, refund_amount, purchase['partner_id'], payment_method, reason, current_user.id))
+        return_id = c.lastrowid
+        for it in return_items_detail:
+            c.execute("INSERT INTO purchase_return_items (return_id, product_id, quantity, unit_cost_at_return, subtotal) VALUES (?, ?, ?, ?, ?)",
+                      (return_id, it['product_id'], it['quantity'], it['unit_cost'], it['subtotal']))
+        c.execute("UPDATE purchases SET is_returned = 1 WHERE id = ?", (purchase_id,))
+        conn.commit()
+        return jsonify({'message': '采购退货成功', 'return_id': return_id, 'refund_amount': refund_amount})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 400
+    finally:
+        conn.close()
 # ---------- 销售历史 ----------
 @app.route('/api/sales', methods=['GET'])
 @login_required
 def get_sales():
     conn,c = get_db()
-    c.execute('''SELECT s.id,s.sale_time,s.total_amount,s.member_id,s.partner_id,s.payment_method,u.username as created_by_name
+    c.execute('''SELECT s.id,s.sale_time,s.total_amount,s.member_id,s.partner_id,s.payment_method,s.is_returned,u.username as created_by_name
                  FROM sales s LEFT JOIN users u ON s.created_by=u.id ORDER BY s.sale_time DESC''')
     sales = [dict(row) for row in c.fetchall()]
     for s in sales:
@@ -991,18 +1298,39 @@ def get_sale_detail(sid):
     conn.close()
     return jsonify(sale)
 
-# ---------- 财务报表 ----------
+# ---------- 财务报表（修正：扣除退货）----------
 @app.route('/api/financial_report')
 @login_required
 @role_required(['admin'])
 def financial_report():
     conn,c = get_db()
-    c.execute("SELECT SUM(quantity*price_at_sale) as sales, SUM(quantity*cost_at_sale) as cost FROM sale_items")
-    sc = c.fetchone()
-    total_sales = sc['sales'] or 0
-    total_cost = sc['cost'] or 0
-    c.execute("SELECT SUM(total_amount) as purchases FROM purchases")
-    total_purchases = c.fetchone()[0] or 0
+    # 销售收入 = 销售总额 - 销售退货总额（退款金额）
+    c.execute("SELECT SUM(total_amount) as sales_total FROM sales")
+    sales_total = c.fetchone()[0] or 0
+    c.execute("SELECT SUM(refund_amount) as returns_total FROM sales_returns")
+    returns_total = c.fetchone()[0] or 0
+    total_sales = sales_total - returns_total
+    
+    # 销售成本 = 原销售成本 - 退货商品的成本（按原销售时的成本）
+    # 原销售成本
+    c.execute("SELECT SUM(quantity * cost_at_sale) as cost_total FROM sale_items")
+    cost_total = c.fetchone()[0] or 0
+    # 退货成本：从 sales_return_items 中获取退货数量对应的原成本（从原 sale_items 关联）
+    c.execute('''SELECT SUM(sri.quantity * si.cost_at_sale) as return_cost
+                 FROM sales_return_items sri
+                 JOIN sale_items si ON si.sale_id = (SELECT original_sale_id FROM sales_returns WHERE id = sri.return_id)
+                 AND si.product_id = sri.product_id''')
+    return_cost = c.fetchone()[0] or 0
+    total_cost = cost_total - return_cost
+    
+    # 采购总额 = 原采购总额 - 采购退货总额
+    c.execute("SELECT SUM(total_amount) as purchase_total FROM purchases")
+    purchase_total = c.fetchone()[0] or 0
+    c.execute("SELECT SUM(refund_amount) as purchase_return_total FROM purchase_returns")
+    purchase_return_total = c.fetchone()[0] or 0
+    total_purchases = purchase_total - purchase_return_total
+    
+    # 当前库存价值（按平均成本，已自动更新）
     c.execute("SELECT SUM(stock*cost) as inv_value FROM products")
     inv_val = c.fetchone()[0] or 0
     c.execute("SELECT SUM(balance) as member_bal FROM members WHERE card_type='stored_value'")
@@ -1155,11 +1483,11 @@ def update_payment_methods():
     update_setting('payment_methods', json.dumps(methods))
     return jsonify({'message': '保存成功'})
 
-# ---------- 当前用户 ----------
 @app.route('/api/current_user')
 @login_required
 def current_user_info():
     return jsonify({'id':current_user.id, 'username':current_user.username, 'role':current_user.role})
+
 # ---------- 登录登出 ----------
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -1182,7 +1510,101 @@ def logout():
     logout_user()
     return redirect(url_for('login'))
 
-# ========== HTML模板 ==========
+# ---------- 导出API（CSV）----------
+@app.route('/api/sales/export')
+@login_required
+def export_sales_csv():
+    conn,c = get_db()
+    c.execute('''SELECT s.id,s.sale_time,s.total_amount,u.username as operator,m.name as member_name,p.name as customer_name,s.payment_method
+                 FROM sales s LEFT JOIN users u ON s.created_by=u.id 
+                 LEFT JOIN members m ON s.member_id=m.id 
+                 LEFT JOIN partners p ON s.partner_id=p.id
+                 ORDER BY s.sale_time DESC''')
+    rows = c.fetchall()
+    conn.close()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['销售单号','销售时间','总金额(元)','操作员','会员','客户','支付方式'])
+    for r in rows:
+        writer.writerow([r['id'], r['sale_time'], r['total_amount'], r['operator'] or '', r['member_name'] or '散客', r['customer_name'] or '', r['payment_method']])
+    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=sales_export.csv"})
+
+@app.route('/api/products/export')
+@login_required
+def export_products_csv():
+    conn,c = get_db()
+    c.execute("SELECT id,name,price,cost,stock FROM products")
+    rows = c.fetchall()
+    conn.close()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID','商品名称','售价(元)','成本价(元)','库存数量'])
+    for r in rows:
+        writer.writerow([r['id'], r['name'], r['price'], r['cost'], r['stock']])
+    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=inventory_export.csv"})
+
+@app.route('/api/members/export')
+@login_required
+@role_required(['admin'])
+def export_members_csv():
+    conn,c = get_db()
+    c.execute("SELECT id,name,phone,card_type,balance,remaining_counts,valid_from,valid_to FROM members")
+    rows = c.fetchall()
+    conn.close()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID','姓名','手机号','卡类型','储值余额','剩余次数','生效日期','失效日期'])
+    for r in rows:
+        writer.writerow([r['id'], r['name'], r['phone'], r['card_type'], r['balance'], r['remaining_counts'], r['valid_from'] or '', r['valid_to'] or ''])
+    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=members_export.csv"})
+
+@app.route('/api/initial_balances', methods=['GET'])
+@login_required
+def get_initial_balances():
+    cash = float(get_setting('current_cash', '0'))
+    bank = float(get_setting('current_bank', '0'))
+    return jsonify({'cash': cash, 'bank': bank})
+
+@app.route('/api/initial_balances', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def set_initial_balances():
+    data = request.get_json()
+    cash = data.get('cash', 0)
+    bank = data.get('bank', 0)
+    update_setting('current_cash', cash)
+    update_setting('current_bank', bank)
+    return jsonify({'message': '保存成功'})
+POS_HTML = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>收银台</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>.cart-item{border-bottom:1px solid #eee;padding:8px 0}.low-stock{color:#d9534f}</style></head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link active" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
+<div class="container mt-4"><div class="row"><div class="col-md-7"><h3>商品列表</h3><input type="text" id="searchInput" class="form-control mb-3" placeholder="搜索..."><div id="productList" class="row"></div></div><div class="col-md-5"><h3>购物车 <button class="btn btn-sm btn-danger" id="clearCartBtn">清空</button></h3><div id="cartItems"></div><div class="mt-3"><div><label>支付方式</label><select id="paymentMethod" class="form-select"></select></div><div id="memberSelectDiv" style="display:none"><label>会员ID</label><input type="number" id="memberId" class="form-control" placeholder="输入会员ID"></div><div class="mt-2"><label>客户（往来单位）</label><select id="customerSelect" class="form-select"><option value="">散客（不记录）</option></select></div><h4 class="mt-2">总计: ¥<span id="cartTotal">0.00</span></h4><div class="mt-2"><label>实收金额（可修改）</label><input type="number" id="actualAmount" class="form-control" step="0.01" value="0" oninput="syncActualAmount()"><small class="text-muted">默认为总计金额，可打折或抹零</small></div><button class="btn btn-success w-100 mt-3" id="checkoutBtn">结算</button></div></div></div></div>
+<script>
+let customers=[];
+function syncActualAmount(){ let total=parseFloat(document.getElementById('cartTotal').innerText); let actual=parseFloat(document.getElementById('actualAmount').value); if(isNaN(actual)) actual=total; if(actual<0) actual=0; document.getElementById('actualAmount').value=actual.toFixed(2); }
+async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const search=document.getElementById('searchInput').value.toLowerCase(); const filtered=ps.filter(p=>p.name.toLowerCase().includes(search)); document.getElementById('productList').innerHTML=filtered.map(p=>`<div class="col-6 col-md-4 mb-3"><div class="card"><div class="card-body"><h6>${escapeHtml(p.name)}</h6><p>¥${p.price.toFixed(2)}<br>库存:${p.stock} ${p.stock<10?'<span class="low-stock">(低)</span>':''}</p><div class="input-group"><input type="number" id="qty_${p.id}" class="form-control" value="1" min="1" max="${p.stock}"><button class="btn btn-primary btn-sm" onclick="addToCart(${p.id})">加入</button></div></div></div></div>`).join(''); }
+async function loadCustomers(){ const resp=await fetch('/api/partners'); const all=await resp.json(); customers=all.filter(p=>p.type==='customer'); const select=document.getElementById('customerSelect'); select.innerHTML='<option value="">散客（不记录）</option>'+customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join(''); }
+async function loadPaymentMethods(){ const resp=await fetch('/api/payment_methods'); const methods=await resp.json(); const select=document.getElementById('paymentMethod'); select.innerHTML=methods.map(m=>`<option value="${m}">${m}</option>`).join(''); }
+function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
+async function addToCart(pid){ let qty=parseInt(document.getElementById(`qty_${pid}`).value)||1; const resp=await fetch('/api/cart/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok){ loadCart(); showToast('添加成功','success'); }else{ const err=await resp.json(); showToast(err.error,'danger'); } }
+async function loadCart(){ const resp=await fetch('/api/cart'); const data=await resp.json(); const cartDiv=document.getElementById('cartItems'); if(data.items.length===0){ cartDiv.innerHTML='<p class="text-muted">购物车为空</p>'; document.getElementById('cartTotal').innerText='0.00'; document.getElementById('actualAmount').value='0.00'; return; } cartDiv.innerHTML=data.items.map(it=>`<div class="cart-item d-flex justify-content-between"><div><strong>${escapeHtml(it.name)}</strong><br>¥${it.price} × ${it.quantity} = ¥${it.subtotal}</div><div><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity-1})">-</button><span class="mx-1">${it.quantity}</span><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity+1})">+</button><button class="btn btn-sm btn-danger ms-2" onclick="removeFromCart(${it.product_id})">删</button></div></div>`).join(''); document.getElementById('cartTotal').innerText=data.total.toFixed(2); document.getElementById('actualAmount').value=data.total.toFixed(2); }
+async function updateCart(pid,qty){ if(qty<=0){ removeFromCart(pid); return; } const resp=await fetch('/api/cart/update',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok) loadCart(); else{ const err=await resp.json(); showToast(err.error,'danger'); } }
+async function removeFromCart(pid){ await fetch('/api/cart/remove',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid})}); loadCart(); }
+document.getElementById('clearCartBtn').onclick=async()=>{ await fetch('/api/cart/clear',{method:'DELETE'}); loadCart(); };
+document.getElementById('paymentMethod').onchange=function(){ document.getElementById('memberSelectDiv').style.display=this.value==='member_card'?'block':'none'; };
+document.getElementById('checkoutBtn').onclick=async()=>{ let member_id=null, pm=document.getElementById('paymentMethod').value; if(pm==='member_card'){ member_id=parseInt(document.getElementById('memberId').value); if(isNaN(member_id)){ showToast('请输入会员ID','danger'); return; } } const customer_id=document.getElementById('customerSelect').value||null; const actual_amount=parseFloat(document.getElementById('actualAmount').value)||0; const resp=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment_method:pm,member_id:member_id,customer_id:customer_id,actual_amount:actual_amount})}); const result=await resp.json(); if(resp.ok){ showToast(`结算成功！金额:¥${result.total_amount}`,'success'); loadCart(); loadProducts(); if(result.ticket) printTicket(result.ticket); }else{ showToast(result.error,'danger'); } };
+function printTicket(ticket){ let html=`<html><head><title>销售小票</title><style>body{font-family:monospace;padding:20px}table{width:100%}</style></head><body><h3>商超收银系统</h3><p>单号:${ticket.sale_id}<br>时间:${ticket.sale_time}<br>操作员:${ticket.operator}<br>会员:${ticket.member||'散客'}<br>客户:${ticket.customer||''}</p><div class="table-responsive"><table border="1" cellpadding="4"><tr><th>商品</th><th>单价</th><th>数量</th><th>小计</th></tr>${ticket.items.map(i=>`<tr><td>${escapeHtml(i.name)}</td><td>¥${i.price.toFixed(2)}</td><td>${i.quantity}</td><td>¥${(i.price*i.quantity).toFixed(2)}</td></tr>`).join('')}<tr><td colspan="3" align="right"><strong>原价</strong></td><td>¥${ticket.total.toFixed(2)}<\/td><\/tr><tr><td colspan="3" align="right"><strong>实收<\/strong><\/td><td>¥${ticket.actual.toFixed(2)}<\/td><\/tr><\/table><\/div><p>支付方式:${ticket.payment_method}<\/p><button onclick="window.print()">打印<\/button><script>setTimeout(function(){window.print();window.close()},500)<\/script><\/body><\/html>`; let w=window.open('','_blank'); w.document.write(html); w.document.close(); }
+document.getElementById('searchInput').addEventListener('input',loadProducts);
+function showToast(msg,type){ const d=document.createElement('div'); d.className=`alert alert-${type} alert-dismissible fade show position-fixed top-0 end-0 m-3`; d.style.zIndex=1050; d.innerHTML=`${msg}<button type="button" class="btn-close" data-bs-dismiss="alert"></button>`; document.body.appendChild(d); setTimeout(()=>d.remove(),2000); }
+loadProducts(); loadCart(); loadCustomers(); loadPaymentMethods();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body></html>
+'''
 LOGIN_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1200,7 +1622,7 @@ USERADMIN_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link active" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>操作员管理</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addUserModal">+ 新增操作员</button></div>
-<div class="table-responsive"><table class="table table-bordered mt-3"><thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="userTableBody"></tbody></table></div></div>
+<div class="table-responsive"><table class="table table-bordered mt-3"><thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>创建时间</th><th>操作</th><tr></thead><tbody id="userTableBody"></tbody></table></div></div>
 <div class="modal fade" id="addUserModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>新增操作员</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div><label>用户名</label><input id="newUsername" class="form-control"></div><div><label>姓名</label><input id="newFullname" class="form-control"></div><div><label>密码</label><input id="newPassword" type="password" class="form-control"></div><div><label>角色</label><select id="newRole" class="form-select"><option value="operator">操作员</option><option value="admin">管理员</option></select></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="submitAddUser">保存</button></div></div></div></div>
 <div class="modal fade" id="resetPwModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>重置密码</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="resetUserId"><div><label>新密码</label><input id="resetPassword" type="password" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-warning" id="submitResetPw">确认重置</button></div></div></div></div>
 <script>
@@ -1216,35 +1638,6 @@ loadUsers();
 </body></html>
 '''
 
-POS_HTML = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>收银台</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>.cart-item{border-bottom:1px solid #eee;padding:8px 0}.low-stock{color:#d9534f}</style></head>
-<body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link active" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
-<div class="container mt-4"><div class="row"><div class="col-md-7"><h3>商品列表</h3><input type="text" id="searchInput" class="form-control mb-3" placeholder="搜索..."><div id="productList" class="row"></div></div><div class="col-md-5"><h3>购物车 <button class="btn btn-sm btn-danger" id="clearCartBtn">清空</button></h3><div id="cartItems"></div><div class="mt-3"><div><label>支付方式</label><select id="paymentMethod" class="form-select"></select></div><div id="memberSelectDiv" style="display:none"><label>会员ID</label><input type="number" id="memberId" class="form-control" placeholder="输入会员ID"></div><div class="mt-2"><label>客户（往来单位）</label><select id="customerSelect" class="form-select"><option value="">散客（不记录）</option></select></div><h4 class="mt-2">总计: ¥<span id="cartTotal">0.00</span></h4><button class="btn btn-success w-100" id="checkoutBtn">结算</button></div></div></div></div>
-<script>
-let customers=[];
-async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const search=document.getElementById('searchInput').value.toLowerCase(); const filtered=ps.filter(p=>p.name.toLowerCase().includes(search)); document.getElementById('productList').innerHTML=filtered.map(p=>`<div class="col-6 col-md-4 mb-3"><div class="card"><div class="card-body"><h6>${escapeHtml(p.name)}</h6><p>¥${p.price.toFixed(2)}<br>库存:${p.stock} ${p.stock<10?'<span class="low-stock">(低)</span>':''}</p><div class="input-group"><input type="number" id="qty_${p.id}" class="form-control" value="1" min="1" max="${p.stock}"><button class="btn btn-primary btn-sm" onclick="addToCart(${p.id})">加入</button></div></div></div></div>`).join(''); }
-async function loadCustomers(){ const resp=await fetch('/api/partners'); const all=await resp.json(); customers=all.filter(p=>p.type==='customer'); const select=document.getElementById('customerSelect'); select.innerHTML='<option value="">散客（不记录）</option>'+customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join(''); }
-async function loadPaymentMethods(){ const resp=await fetch('/api/payment_methods'); const methods=await resp.json(); const select=document.getElementById('paymentMethod'); select.innerHTML=methods.map(m=>`<option value="${m}">${m}</option>`).join(''); }
-function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
-async function addToCart(pid){ let qty=parseInt(document.getElementById(`qty_${pid}`).value)||1; const resp=await fetch('/api/cart/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok){ loadCart(); showToast('添加成功','success'); }else{ const err=await resp.json(); showToast(err.error,'danger'); } }
-async function loadCart(){ const resp=await fetch('/api/cart'); const data=await resp.json(); const cartDiv=document.getElementById('cartItems'); if(data.items.length===0){ cartDiv.innerHTML='<p class="text-muted">购物车为空</p>'; document.getElementById('cartTotal').innerText='0.00'; return; } cartDiv.innerHTML=data.items.map(it=>`<div class="cart-item d-flex justify-content-between"><div><strong>${escapeHtml(it.name)}</strong><br>¥${it.price} × ${it.quantity} = ¥${it.subtotal}</div><div><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity-1})">-</button><span class="mx-1">${it.quantity}</span><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity+1})">+</button><button class="btn btn-sm btn-danger ms-2" onclick="removeFromCart(${it.product_id})">删</button></div></div>`).join(''); document.getElementById('cartTotal').innerText=data.total.toFixed(2); }
-async function updateCart(pid,qty){ if(qty<=0){ removeFromCart(pid); return; } const resp=await fetch('/api/cart/update',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok) loadCart(); else{ const err=await resp.json(); showToast(err.error,'danger'); } }
-async function removeFromCart(pid){ await fetch('/api/cart/remove',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid})}); loadCart(); }
-document.getElementById('clearCartBtn').onclick=async()=>{ await fetch('/api/cart/clear',{method:'DELETE'}); loadCart(); };
-document.getElementById('paymentMethod').onchange=function(){ document.getElementById('memberSelectDiv').style.display=this.value==='member_card'?'block':'none'; };
-document.getElementById('checkoutBtn').onclick=async()=>{ let member_id=null, pm=document.getElementById('paymentMethod').value; if(pm==='member_card'){ member_id=parseInt(document.getElementById('memberId').value); if(isNaN(member_id)){ showToast('请输入会员ID','danger'); return; } } const customer_id=document.getElementById('customerSelect').value||null; const resp=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment_method:pm,member_id:member_id,customer_id:customer_id})}); const result=await resp.json(); if(resp.ok){ showToast(`结算成功！金额:¥${result.total_amount}`,'success'); loadCart(); loadProducts(); if(result.ticket) printTicket(result.ticket); }else{ showToast(result.error,'danger'); } };
-function printTicket(ticket){ let html=`<html><head><title>销售小票</title><style>body{font-family:monospace;padding:20px}table{width:100%}</style></head><body><h3>商超收银系统</h3><p>单号:${ticket.sale_id}<br>时间:${ticket.sale_time}<br>操作员:${ticket.operator}<br>会员:${ticket.member||'散客'}<br>客户:${ticket.customer||''}</p><div class="table-responsive"><table border="1" cellpadding="4"><tr><th>商品</th><th>单价</th><th>数量</th><th>小计</th></tr>${ticket.items.map(i=>`<tr><td>${escapeHtml(i.name)}</td><td>¥${i.price.toFixed(2)}</td><td>${i.quantity}</td><td>¥${(i.price*i.quantity).toFixed(2)}</td></tr>`).join('')}<tr><td colspan="3" align="right"><strong>总计</strong></td><td>¥${ticket.total.toFixed(2)}</td></tr></table></div><p>支付方式:${ticket.payment_method}</p><button onclick="window.print()">打印</button><script>setTimeout(function(){window.print();window.close()},500)<\/script></body></html>`; let w=window.open('','_blank'); w.document.write(html); w.document.close(); }
-document.getElementById('searchInput').addEventListener('input',loadProducts);
-function showToast(msg,type){ const d=document.createElement('div'); d.className=`alert alert-${type} alert-dismissible fade show position-fixed top-0 end-0 m-3`; d.style.zIndex=1050; d.innerHTML=`${msg}<button type="button" class="btn-close" data-bs-dismiss="alert"></button>`; document.body.appendChild(d); setTimeout(()=>d.remove(),2000); }
-loadProducts(); loadCart(); loadCustomers(); loadPaymentMethods();
-</script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-</body></html>
-'''
 INVENTORY_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1252,10 +1645,10 @@ INVENTORY_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link active" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button><button class="btn btn-outline-light btn-sm" onclick="exportInventory()">📎 导出 CSV</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>商品库存</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#productModal" onclick="openAddModal()">+ 新增商品</button></div>
-<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>售价</th><th>成本</th><th>库存</th><th>状态</th><th>操作</th></tr></thead><tbody id="productTableBody"></tbody></td></div></div>
+<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>售价</th><th>成本</th><th>库存</th><th>状态</th><th>操作</th></tr></thead><tbody id="productTableBody"></tbody></tr></div></div>
 <div class="modal fade" id="productModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 id="modalTitle">商品</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="editId"><div><label>名称</label><input id="prodName" class="form-control"></div><div><label>售价</label><input id="prodPrice" type="number" step="0.01" class="form-control"></div><div><label>成本</label><input id="prodCost" type="number" step="0.01" class="form-control"></div><div><label>库存</label><input id="prodStock" type="number" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveProductBtn">保存</button></div></div></div></div>
 <script>
-async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const tbody=document.getElementById('productTableBody'); tbody.innerHTML=ps.map(p=>`<tr><td>${p.id}</td><td>${escapeHtml(p.name)}</td><td>${p.price.toFixed(2)}</td><td>${p.cost.toFixed(2)}</td><td>${p.stock}</td><td>${p.stock<10?'<span class="badge bg-warning">低库存</span>':'<span class="badge bg-success">充足</span>'}</td><td><button class="btn btn-sm btn-warning" onclick="openEditModal(${p.id},'${escapeHtml(p.name)}',${p.price},${p.cost},${p.stock})">编辑</button> <button class="btn btn-sm btn-danger" onclick="deleteProduct(${p.id})">删除</button></td></tr>`).join(''); }
+async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const tbody=document.getElementById('productTableBody'); tbody.innerHTML=ps.map(p=>`<tr><td>${p.id}</td><td>${escapeHtml(p.name)}</td><td>${p.price.toFixed(2)}</td><td>${p.cost.toFixed(2)}</td><td>${p.stock}</td><td>${p.stock<10?'<span class="badge bg-warning">低库存</span>':'<span class="badge bg-success">充足</span>'}</td><td><button class="btn btn-sm btn-warning" onclick="openEditModal(${p.id},'${escapeHtml(p.name)}',${p.price},${p.cost},${p.stock})">编辑</button> <button class="btn btn-sm btn-danger" onclick="deleteProduct(${p.id})">删除</button></td></table>`).join(''); }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 function openAddModal(){ document.getElementById('editId').value=''; document.getElementById('prodName').value=''; document.getElementById('prodPrice').value=''; document.getElementById('prodCost').value=''; document.getElementById('prodStock').value=''; new bootstrap.Modal(document.getElementById('productModal')).show(); }
 function openEditModal(id,name,price,cost,stock){ document.getElementById('editId').value=id; document.getElementById('prodName').value=name; document.getElementById('prodPrice').value=price; document.getElementById('prodCost').value=cost; document.getElementById('prodStock').value=stock; new bootstrap.Modal(document.getElementById('productModal')).show(); }
@@ -1275,20 +1668,83 @@ SALES_HTML = '''
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>销售记录</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link active" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button><button class="btn btn-outline-light btn-sm" onclick="exportSales()">📎 导出 CSV</button></div></div></nav>
-<div class="container mt-4"><h3>销售历史记录</h3><div class="table-responsive"><table class="table table-hover"><thead><tr><th>单号</th><th>时间</th><th>金额</th><th>会员</th><th>客户</th><th>支付方式</th><th>操作员</th><th>操作</th></tr></thead><tbody id="salesTableBody"></tbody></table></div></div>
+<div class="container mt-4"><h3>销售历史记录</h3><div class="table-responsive"><table class="table table-hover"><thead><tr><th>单号</th><th>时间</th><th>金额</th><th>会员</th><th>客户</th><th>支付方式</th><th>操作员</th><th>状态</th><th>操作</th></tr></thead><tbody id="salesTableBody"></tbody></table></div></div>
 <div class="modal fade" id="detailModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>销售详情</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body" id="detailContent"></div></div></div></div>
+<div class="modal fade" id="returnModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">销售退货 - 单号 <span id="returnSaleId"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div id="returnItemsContainer"></div><div class="mt-2"><label>实退金额（可修改）</label><input type="number" id="refundAmount" class="form-control" step="0.01"></div><div class="mt-2"><label>退货原因</label><input type="text" id="returnReason" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-danger" id="confirmReturnBtn">确认退货</button></div></div></div></div>
 <script>
-async function loadSales(){ const resp=await fetch('/api/sales'); const sales=await resp.json(); const tbody=document.getElementById('salesTableBody'); tbody.innerHTML=sales.map(s=>`<tr><td>${s.id}</td><td>${s.sale_time}</td><td>${s.total_amount.toFixed(2)}</td><td>${s.member_name||'散客'}</td><td>${s.customer_name||''}</td><td>${s.payment_method}</td><td>${s.created_by_name||''}</td><td><button class="btn btn-sm btn-info" onclick="viewDetail(${s.id})">详情</button> <button class="btn btn-sm btn-secondary" onclick="exportPDF(${s.id})">PDF</button></td></tr>`).join(''); }
-async function viewDetail(id){ const resp=await fetch(`/api/sales/${id}`); const d=await resp.json(); if(resp.ok){ let itemsHtml=d.items.map(i=>`<tr><td>${escapeHtml(i.name)}</td><td>${i.quantity}</td><td>${i.price_at_sale.toFixed(2)}</td><td>${i.subtotal.toFixed(2)}</td></tr>`).join(''); document.getElementById('detailContent').innerHTML=`<p>单号:${d.id}</p><p>时间:${d.sale_time}</p><p>总金额:${d.total_amount}</p><p>会员:${d.member_name||'无'}</p><p>客户:${d.customer_name||'无'}</p><div class="table-responsive"><table class="table table-sm"><thead><tr><th>商品</th><th>数量</th><th>单价</th><th>小计</th></tr></thead><tbody>${itemsHtml}</tbody></table></div>`; new bootstrap.Modal(document.getElementById('detailModal')).show(); } else alert('加载失败'); }
+let currentReturnSaleId = null;
+async function loadSales(){ const resp=await fetch('/api/sales'); const sales=await resp.json(); const tbody=document.getElementById('salesTableBody'); tbody.innerHTML=sales.map(s=>`<tr><td>${s.id}</td><td>${s.sale_time}</td><td>${s.total_amount.toFixed(2)}<\/td><td>${s.member_name||'散客'}<\/td><td>${s.customer_name||''}<\/td><td>${s.payment_method}<\/td><td>${s.created_by_name||''}<\/td><td>${s.is_returned?'已退货':'正常'}<\/td><td><button class="btn btn-sm btn-info" onclick="viewDetail(${s.id})">详情</button> <button class="btn btn-sm btn-secondary" onclick="exportPDF(${s.id})">PDF</button> ${s.is_returned?'':'<button class="btn btn-sm btn-warning" onclick="showReturnModal('+s.id+')">退货</button>'}<\/td><\/tr>`).join(''); }
+async function viewDetail(id){ const resp=await fetch(`/api/sales/${id}`); const d=await resp.json(); if(resp.ok){ let itemsHtml=d.items.map(i=>`<tr><td>${escapeHtml(i.name)}<\/td><td>${i.quantity}<\/td><td>${i.price_at_sale.toFixed(2)}<\/td><td>${i.subtotal.toFixed(2)}<\/td><\/tr>`).join(''); document.getElementById('detailContent').innerHTML=`<p>单号:${d.id}<\/p><p>时间:${d.sale_time}<\/p><p>总金额:${d.total_amount}<\/p><p>会员:${d.member_name||'无'}<\/p><p>客户:${d.customer_name||'无'}<\/p><div class="table-responsive"><table class="table table-sm"><thead><tr><th>商品</th><th>数量</th><th>单价</th><th>小计</th></tr></thead><tbody>${itemsHtml}<\/tbody><\/table><\/div>`; new bootstrap.Modal(document.getElementById('detailModal')).show(); } else alert('加载失败'); }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 function exportSales(){ window.location.href='/api/sales/export'; }
 function exportPDF(id){ window.location.href=`/api/sales/${id}/pdf`; }
+async function showReturnModal(saleId){
+    currentReturnSaleId = saleId;
+    document.getElementById('returnSaleId').innerText = saleId;
+    const resp = await fetch(`/api/sales/${saleId}/returnable_items`);
+    const items = await resp.json();
+    const container = document.getElementById('returnItemsContainer');
+    container.innerHTML = '<h6>选择退货商品及数量</h6>';
+    let total = 0;
+    items.forEach(item => {
+        if (item.available_qty <= 0) return;
+        total += item.price_at_sale * item.available_qty;
+        container.innerHTML += `
+            <div class="row mb-2" data-product-id="${item.product_id}">
+                <div class="col-4">${escapeHtml(item.name)}</div>
+                <div class="col-3"><input type="number" class="form-control return-qty" data-price="${item.price_at_sale}" data-max="${item.available_qty}" placeholder="数量"></div>
+                <div class="col-3">单价 ¥${item.price_at_sale}</div>
+                <div class="col-2 subtotal">0.00</div>
+            </div>
+        `;
+    });
+    document.getElementById('refundAmount').value = total.toFixed(2);
+    document.querySelectorAll('.return-qty').forEach(input => {
+        input.addEventListener('input', function() {
+            let qty = parseFloat(this.value) || 0;
+            let max = parseFloat(this.dataset.max);
+            if (qty > max) qty = max;
+            let price = parseFloat(this.dataset.price);
+            let sub = (qty * price).toFixed(2);
+            this.parentElement.parentElement.querySelector('.subtotal').innerText = sub;
+            let totalRefund = 0;
+            document.querySelectorAll('.return-qty').forEach(inp => {
+                let q = parseFloat(inp.value) || 0;
+                let p = parseFloat(inp.dataset.price);
+                totalRefund += q * p;
+            });
+            document.getElementById('refundAmount').value = totalRefund.toFixed(2);
+        });
+    });
+    new bootstrap.Modal(document.getElementById('returnModal')).show();
+}
+document.getElementById('confirmReturnBtn').onclick = async () => {
+    const items = [];
+    document.querySelectorAll('.return-qty').forEach(input => {
+        let qty = parseInt(input.value);
+        if (qty > 0) {
+            const row = input.closest('.row');
+            const productId = parseInt(row.dataset.productId);
+            items.push({ product_id: productId, quantity: qty });
+        }
+    });
+    if (items.length === 0) { alert('请至少选择一种商品退货'); return; }
+    const refund_amount = parseFloat(document.getElementById('refundAmount').value);
+    const reason = document.getElementById('returnReason').value;
+    const resp = await fetch('/api/sales/return', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ original_sale_id: currentReturnSaleId, items: items, refund_amount: refund_amount, reason: reason })
+    });
+    const result = await resp.json();
+    if (resp.ok) { alert('退货成功！退款金额：' + result.refund_amount); bootstrap.Modal.getInstance(document.getElementById('returnModal')).hide(); loadSales(); }
+    else { alert('退货失败：' + result.error); }
+};
 loadSales();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
 </body></html>
 '''
-
 MEMBERS_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1296,9 +1752,10 @@ MEMBERS_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link active" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button><button class="btn btn-outline-light btn-sm" onclick="exportMembers()">📎 导出 CSV</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>会员列表</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#memberModal" onclick="openAddModal()">+ 新增会员</button></div>
-<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>姓名</th><th>手机</th><th>卡类型</th><th>余额/次数</th><th>有效期</th><th>操作</th></tr></thead><tbody id="memberTableBody"></tbody></table></div></div>
+<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>姓名</th><th>手机</th><th>卡类型</th><th>余额/次数</th><th>有效期</th><th>操作</th></tr></thead><tbody id="memberTableBody"></tbody></tr></div></div>
 <div class="modal fade" id="memberModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>会员</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="editMemberId"><div><label>姓名</label><input id="memberName" class="form-control"></div><div><label>手机</label><input id="memberPhone" class="form-control"></div><div><label>卡类型</label><select id="cardType" class="form-select"><option value="stored_value">储值卡</option><option value="count_limited">次卡</option><option value="time_limited">期限卡</option></select></div><div id="balanceDiv"><label>初始余额</label><input id="initBalance" type="number" step="0.01" class="form-control" value="0"></div><div id="countsDiv" style="display:none"><label>初始次数</label><input id="initCounts" type="number" class="form-control" value="0"></div><div id="validDiv" style="display:none"><label>生效日期</label><input id="validFrom" type="date" class="form-control"><label>失效日期</label><input id="validTo" type="date" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveMemberBtn">保存</button></div></div></div></div>
 <div class="modal fade" id="rechargeModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>会员充值</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="rechargeMemberId"><p id="rechargeMemberInfo"></p><div id="rechargeAmountDiv"><label>充值金额</label><input id="rechargeAmount" type="number" step="0.01" class="form-control" value="0"></div><div id="rechargeCountsDiv" style="display:none"><label>充值次数</label><input id="rechargeCounts" type="number" class="form-control" value="0"></div></div><div class="modal-footer"><button class="btn btn-primary" id="doRechargeBtn">确认充值</button></div></div></div></div>
+<div class="modal fade" id="transactionsModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>会员交易记录</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="table-responsive"><table class="table table-sm" id="transactionsTable"><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>次数变化</th><th>描述</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></div></div></div>
 <script>
 async function loadMembers(){ const resp=await fetch('/api/members'); const ms=await resp.json(); const tbody=document.getElementById('memberTableBody'); tbody.innerHTML=ms.map(m=>`<tr><td>${m.id}</td><td>${escapeHtml(m.name)}</td><td>${m.phone}</td><td>${m.card_type==='stored_value'?'储值卡':m.card_type==='count_limited'?'次卡':'期限卡'}</td><td>余额:${m.balance} 次数:${m.remaining_counts}</td><td>${m.valid_from||'无'}~${m.valid_to||'无'}</td><td><button class="btn btn-sm btn-info" onclick="showRecharge(${m.id},'${escapeHtml(m.name)}','${m.card_type}')">充值</button> <button class="btn btn-sm btn-secondary" onclick="viewTransactions(${m.id})">记录</button></td></tr>`).join(''); }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
@@ -1308,7 +1765,26 @@ document.getElementById('cardType').addEventListener('change',toggleFields);
 document.getElementById('saveMemberBtn').onclick=async()=>{ const name=document.getElementById('memberName').value.trim(); const phone=document.getElementById('memberPhone').value.trim(); const card_type=document.getElementById('cardType').value; let balance=0,remaining_counts=0,valid_from=null,valid_to=null; if(card_type==='stored_value') balance=parseFloat(document.getElementById('initBalance').value)||0; if(card_type==='count_limited') remaining_counts=parseInt(document.getElementById('initCounts').value)||0; if(card_type==='time_limited'){ valid_from=document.getElementById('validFrom').value; valid_to=document.getElementById('validTo').value; } if(!name||!phone){ alert('请填写完整'); return; } const resp=await fetch('/api/members',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,phone,card_type,balance,remaining_counts,valid_from,valid_to})}); if(resp.ok){ bootstrap.Modal.getInstance(document.getElementById('memberModal')).hide(); loadMembers(); showToast('成功','success'); }else{ const err=await resp.json(); alert(err.error); } };
 async function showRecharge(id,name,card_type){ document.getElementById('rechargeMemberId').value=id; document.getElementById('rechargeMemberInfo').innerText=`会员：${name} (${card_type==='stored_value'?'储值卡':card_type==='count_limited'?'次卡':'期限卡'})`; document.getElementById('rechargeAmountDiv').style.display=card_type==='stored_value'?'block':'none'; document.getElementById('rechargeCountsDiv').style.display=card_type==='count_limited'?'block':'none'; document.getElementById('rechargeAmount').value=0; document.getElementById('rechargeCounts').value=0; new bootstrap.Modal(document.getElementById('rechargeModal')).show(); }
 document.getElementById('doRechargeBtn').onclick=async()=>{ const id=document.getElementById('rechargeMemberId').value; let amount=parseFloat(document.getElementById('rechargeAmount').value)||0; let counts=parseInt(document.getElementById('rechargeCounts').value)||0; if(amount===0 && counts===0){ alert('请输入充值金额或次数'); return; } const resp=await fetch(`/api/members/${id}/recharge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount,counts})}); if(resp.ok){ bootstrap.Modal.getInstance(document.getElementById('rechargeModal')).hide(); loadMembers(); showToast('充值成功','success'); }else{ const err=await resp.json(); alert(err.error); } };
-async function viewTransactions(id){ const resp=await fetch(`/api/members/${id}/transactions`); const ts=await resp.json(); let msg=ts.map(t=>`${t.transaction_time} ${t.transaction_type==='recharge'?'充值':'消费'} 金额:${t.amount||0} 次数:${t.counts_change||0} ${t.description||''}`).join('\\n'); alert(msg||'无记录'); }
+let currentTransactionsMemberId = null;
+async function viewTransactions(id){
+    currentTransactionsMemberId = id;
+    const resp = await fetch(`/api/members/${id}/transactions`);
+    const ts = await resp.json();
+    const tbody = document.querySelector('#transactionsTable tbody');
+    tbody.innerHTML = ts.map(t => `<tr><td>${t.transaction_time}</td><td>${t.transaction_type==='recharge'?'充值':t.transaction_type==='consume'?'消费':t.transaction_type==='refund'?'退款':t.transaction_type==='recharge_reverse'?'冲销':''}</td><td>${t.amount||0}</td><td>${t.counts_change||0}</td><td>${t.description||''}</td><td>${t.transaction_type==='recharge'?`<button class="btn btn-sm btn-danger" onclick="reverseRecharge(${t.id}, ${t.amount})">冲销</button>`:''}</td></tr>`).join('');
+    new bootstrap.Modal(document.getElementById('transactionsModal')).show();
+}
+async function reverseRecharge(transId, amount){
+    if(!confirm(`确定冲销这笔充值记录？将扣减会员余额 ${amount} 元。`)) return;
+    const resp = await fetch(`/api/members/${currentTransactionsMemberId}/recharge_reverse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transaction_id: transId, amount: amount, reason: '操作员冲销' })
+    });
+    const result = await resp.json();
+    if(resp.ok){ alert('冲销成功'); viewTransactions(currentTransactionsMemberId); loadMembers(); }
+    else alert('冲销失败：'+result.error);
+}
 function showToast(msg,type){ const d=document.createElement('div'); d.className=`alert alert-${type} alert-dismissible fade show position-fixed top-0 end-0 m-3`; d.style.zIndex=1050; d.innerHTML=`${msg}<button type="button" class="btn-close" data-bs-dismiss="alert"></button>`; document.body.appendChild(d); setTimeout(()=>d.remove(),2000); }
 function exportMembers(){ window.location.href='/api/members/export'; }
 loadMembers();
@@ -1319,18 +1795,98 @@ loadMembers();
 PURCHASE_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>采购入库</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>采购管理</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link active" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
-<div class="container mt-4"><h3>采购入库单</h3><div class="row"><div class="col-md-6"><div><label>供应商</label><input id="supplier" class="form-control" placeholder="手动输入供应商名称"></div><div class="mt-2"><label>选择已有供应商</label><select id="partnerSelect" class="form-select"><option value="">-- 选择（将自动填充名称） --</option></select></div><div class="mt-2"><label>支付方式</label><select id="payMethod" class="form-select"></select></div></div><div class="col-md-6"><h5>采购明细</h5><div class="table-responsive"><table class="table table-sm"><thead><tr><th>商品</th><th>数量</th><th>进价</th><th>小计</th><th></th></tr></thead><tbody id="purchaseItemsBody"></tbody></table></div><button class="btn btn-sm btn-primary" onclick="addPurchaseRow()">添加商品</button><button class="btn btn-success mt-3" id="submitPurchase">提交入库</button></div></div></div>
+<div class="container mt-4">
+    <ul class="nav nav-tabs" id="purchaseTab" role="tablist">
+        <li class="nav-item" role="presentation"><button class="nav-link active" id="new-tab" data-bs-toggle="tab" data-bs-target="#new" type="button" role="tab">新建采购入库</button></li>
+        <li class="nav-item" role="presentation"><button class="nav-link" id="history-tab" data-bs-toggle="tab" data-bs-target="#history" type="button" role="tab">采购历史</button></li>
+    </ul>
+    <div class="tab-content mt-3">
+        <div class="tab-pane fade show active" id="new" role="tabpanel">
+            <div class="row"><div class="col-md-6"><div><label>供应商</label><input id="supplier" class="form-control" placeholder="手动输入供应商名称"></div><div class="mt-2"><label>选择已有供应商</label><select id="partnerSelect" class="form-select"><option value="">-- 选择（将自动填充名称） --</option></select></div><div class="mt-2"><label>支付方式</label><select id="payMethod" class="form-select"></select></div></div><div class="col-md-6"><h5>采购明细</h5><div class="table-responsive"><table class="table table-sm"><thead><tr><th>商品</th><th>数量</th><th>进价</th><th>小计</th><th></th></tr></thead><tbody id="purchaseItemsBody"></tbody></table></div><button class="btn btn-sm btn-primary" onclick="addPurchaseRow()">添加商品</button><button class="btn btn-success mt-3" id="submitPurchase">提交入库</button></div></div>
+        </div>
+        <div class="tab-pane fade" id="history" role="tabpanel">
+            <h4>采购历史记录</h4>
+            <div class="table-responsive"><table class="table table-bordered"><thead><tr><th>单号</th><th>时间</th><th>供应商</th><th>总金额</th><th>支付方式</th><th>状态</th><th>操作</th></tr></thead><tbody id="purchaseHistoryBody"></tbody></table></div>
+        </div>
+    </div>
+</div>
+<div class="modal fade" id="purchaseReturnModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>采购退货 - 单号 <span id="returnPurchaseId"></span></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div id="purchaseReturnItemsContainer"></div><div class="mt-2"><label>实退金额（可修改）</label><input type="number" id="purchaseRefundAmount" class="form-control" step="0.01"></div><div class="mt-2"><label>退货原因</label><input type="text" id="purchaseReturnReason" class="form-control"></div><div class="mt-2"><label>退款方式</label><select id="purchaseReturnPayMethod" class="form-select"><option value="cash">现金</option><option value="bank">银行</option></select></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-danger" id="confirmPurchaseReturnBtn">确认退货</button></div></div></div></div>
 <script>
 let itemIndex=0; let products=[], partners=[], paymentMethods=[];
-async function loadData(){ const [pResp, partResp, payResp]=await Promise.all([fetch('/api/products'), fetch('/api/partners'), fetch('/api/payment_methods')]); products=await pResp.json(); partners=await partResp.json(); paymentMethods=await payResp.json(); const select=document.getElementById('partnerSelect'); select.innerHTML='<option value="">-- 选择（将自动填充名称） --</option>'+partners.filter(p=>p.type==='supplier').map(p=>`<option value="${p.id}" data-name="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join(''); const paySelect=document.getElementById('payMethod'); paySelect.innerHTML=paymentMethods.map(m=>`<option value="${m}">${m}</option>`).join(''); }
+let currentReturnPurchaseId = null;
+async function loadData(){ const [pResp, partResp, payResp]=await Promise.all([fetch('/api/products'), fetch('/api/partners'), fetch('/api/payment_methods')]); products=await pResp.json(); partners=await partResp.json(); paymentMethods=await payResp.json(); const select=document.getElementById('partnerSelect'); select.innerHTML='<option value="">-- 选择（将自动填充名称） --</option>'+partners.filter(p=>p.type==='supplier').map(p=>`<option value="${p.id}" data-name="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join(''); const paySelect=document.getElementById('payMethod'); paySelect.innerHTML=paymentMethods.map(m=>`<option value="${m}">${m}</option>`).join(''); loadPurchaseHistory(); }
 function addPurchaseRow(){ const idx=itemIndex++; const tbody=document.getElementById('purchaseItemsBody'); const row=document.createElement('tr'); row.id=`row_${idx}`; row.innerHTML=`<td><select class="form-select product-select" data-idx="${idx}"><option value="">选择商品</option>${products.map(p=>`<option value="${p.id}" data-price="${p.cost}">${escapeHtml(p.name)}</option>`).join('')}</select></td><td><input type="number" class="form-control qty" data-idx="${idx}" value="1" min="1"></td><td><input type="number" step="0.01" class="form-control price" data-idx="${idx}" value="0"></td><td class="subtotal">0.00</td><td><button class="btn btn-sm btn-danger" onclick="document.getElementById('row_${idx}').remove()">删除</button></td>`; tbody.appendChild(row); attachEvents(idx); }
 function attachEvents(idx){ const sel=document.querySelector(`#row_${idx} .product-select`); const qty=document.querySelector(`#row_${idx} .qty`); const price=document.querySelector(`#row_${idx} .price`); const update=()=>{ const selected=sel.options[sel.selectedIndex]; if(selected.value){ const cost=parseFloat(selected.dataset.price)||0; price.value=cost; } const q=parseFloat(qty.value)||0; const p=parseFloat(price.value)||0; document.querySelector(`#row_${idx} .subtotal`).innerText=(q*p).toFixed(2); }; sel.addEventListener('change',update); qty.addEventListener('input',update); price.addEventListener('input',update); update(); }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 document.getElementById('partnerSelect').addEventListener('change',function(){ const selected=this.options[this.selectedIndex]; if(selected.value){ document.getElementById('supplier').value=selected.getAttribute('data-name'); } });
 document.getElementById('submitPurchase').onclick=async()=>{ const items=[]; const rows=document.querySelectorAll('#purchaseItemsBody tr'); for(let row of rows){ const sel=row.querySelector('.product-select'); const pid=sel.value; if(!pid) continue; const qty=parseFloat(row.querySelector('.qty').value); const unitCost=parseFloat(row.querySelector('.price').value); if(isNaN(qty)||isNaN(unitCost)||qty<=0||unitCost<0){ alert('请正确填写数量与进价'); return; } items.push({product_id:parseInt(pid),quantity:qty,unit_cost:unitCost}); } if(items.length===0){ alert('请添加至少一种商品'); return; } let partner_id=document.getElementById('partnerSelect').value; if(partner_id) partner_id=parseInt(partner_id); const supplier=document.getElementById('supplier').value; const payment_method=document.getElementById('payMethod').value; const resp=await fetch('/api/purchases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,partner_id,items,payment_method})}); const result=await resp.json(); if(resp.ok){ alert('采购入库成功！'); location.reload(); }else{ alert(result.error); } };
+async function loadPurchaseHistory(){ const resp=await fetch('/api/purchases'); const purchases=await resp.json(); const tbody=document.getElementById('purchaseHistoryBody'); tbody.innerHTML=purchases.map(p=>`<table><td>${p.id}</td><td>${p.purchase_time}</td><td>${escapeHtml(p.supplier||'')}</td><td>${p.total_amount.toFixed(2)}</td><td>${p.payment_method}</td><td>${p.is_returned?'已退货':'正常'}</td><td>${p.is_returned?'':`<button class="btn btn-sm btn-warning" onclick="showPurchaseReturn(${p.id})">退货</button>`}</td>`).join(''); }
+async function showPurchaseReturn(purchaseId){
+    currentReturnPurchaseId = purchaseId;
+    document.getElementById('returnPurchaseId').innerText = purchaseId;
+    const resp = await fetch(`/api/purchases/${purchaseId}/returnable_items`);
+    const items = await resp.json();
+    const container = document.getElementById('purchaseReturnItemsContainer');
+    container.innerHTML = '<h6>选择退货商品及数量</h6>';
+    let total = 0;
+    items.forEach(item => {
+        if (item.available_qty <= 0) return;
+        total += item.unit_cost * item.available_qty;
+        container.innerHTML += `
+            <div class="row mb-2" data-product-id="${item.product_id}">
+                <div class="col-4">${escapeHtml(item.name)}</div>
+                <div class="col-3"><input type="number" class="form-control purchase-return-qty" data-price="${item.unit_cost}" data-max="${item.available_qty}" placeholder="数量"></div>
+                <div class="col-3">进价 ¥${item.unit_cost}</div>
+                <div class="col-2 subtotal">0.00</div>
+            </div>
+        `;
+    });
+    document.getElementById('purchaseRefundAmount').value = total.toFixed(2);
+    document.querySelectorAll('.purchase-return-qty').forEach(input => {
+        input.addEventListener('input', function() {
+            let qty = parseFloat(this.value) || 0;
+            let max = parseFloat(this.dataset.max);
+            if (qty > max) qty = max;
+            let price = parseFloat(this.dataset.price);
+            let sub = (qty * price).toFixed(2);
+            this.parentElement.parentElement.querySelector('.subtotal').innerText = sub;
+            let totalRefund = 0;
+            document.querySelectorAll('.purchase-return-qty').forEach(inp => {
+                let q = parseFloat(inp.value) || 0;
+                let p = parseFloat(inp.dataset.price);
+                totalRefund += q * p;
+            });
+            document.getElementById('purchaseRefundAmount').value = totalRefund.toFixed(2);
+        });
+    });
+    new bootstrap.Modal(document.getElementById('purchaseReturnModal')).show();
+}
+document.getElementById('confirmPurchaseReturnBtn').onclick = async () => {
+    const items = [];
+    document.querySelectorAll('.purchase-return-qty').forEach(input => {
+        let qty = parseInt(input.value);
+        if (qty > 0) {
+            const row = input.closest('.row');
+            const productId = parseInt(row.dataset.productId);
+            items.push({ product_id: productId, quantity: qty });
+        }
+    });
+    if (items.length === 0) { alert('请至少选择一种商品退货'); return; }
+    const refund_amount = parseFloat(document.getElementById('purchaseRefundAmount').value);
+    const reason = document.getElementById('purchaseReturnReason').value;
+    const payment_method = document.getElementById('purchaseReturnPayMethod').value;
+    const resp = await fetch('/api/purchases/return', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ original_purchase_id: currentReturnPurchaseId, items: items, refund_amount: refund_amount, reason: reason, payment_method: payment_method })
+    });
+    const result = await resp.json();
+    if (resp.ok) { alert('采购退货成功！退款金额：' + result.refund_amount); bootstrap.Modal.getInstance(document.getElementById('purchaseReturnModal')).hide(); loadPurchaseHistory(); location.reload(); }
+    else { alert('退货失败：' + result.error); }
+};
 loadData().then(()=>addPurchaseRow());
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -1399,72 +1955,7 @@ listBackups();
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
 </body></html>
 '''
-# ---------- 导出API（CSV）----------
-@app.route('/api/sales/export')
-@login_required
-def export_sales_csv():
-    conn,c = get_db()
-    c.execute('''SELECT s.id,s.sale_time,s.total_amount,u.username as operator,m.name as member_name,p.name as customer_name,s.payment_method
-                 FROM sales s LEFT JOIN users u ON s.created_by=u.id 
-                 LEFT JOIN members m ON s.member_id=m.id 
-                 LEFT JOIN partners p ON s.partner_id=p.id
-                 ORDER BY s.sale_time DESC''')
-    rows = c.fetchall()
-    conn.close()
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['销售单号','销售时间','总金额(元)','操作员','会员','客户','支付方式'])
-    for r in rows:
-        writer.writerow([r['id'], r['sale_time'], r['total_amount'], r['operator'] or '', r['member_name'] or '散客', r['customer_name'] or '', r['payment_method']])
-    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=sales_export.csv"})
-
-@app.route('/api/products/export')
-@login_required
-def export_products_csv():
-    conn,c = get_db()
-    c.execute("SELECT id,name,price,cost,stock FROM products")
-    rows = c.fetchall()
-    conn.close()
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['ID','商品名称','售价(元)','成本价(元)','库存数量'])
-    for r in rows:
-        writer.writerow([r['id'], r['name'], r['price'], r['cost'], r['stock']])
-    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=inventory_export.csv"})
-
-@app.route('/api/members/export')
-@login_required
-@role_required(['admin'])
-def export_members_csv():
-    conn,c = get_db()
-    c.execute("SELECT id,name,phone,card_type,balance,remaining_counts,valid_from,valid_to FROM members")
-    rows = c.fetchall()
-    conn.close()
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['ID','姓名','手机号','卡类型','储值余额','剩余次数','生效日期','失效日期'])
-    for r in rows:
-        writer.writerow([r['id'], r['name'], r['phone'], r['card_type'], r['balance'], r['remaining_counts'], r['valid_from'] or '', r['valid_to'] or ''])
-    return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition":"attachment;filename=members_export.csv"})
-
-@app.route('/api/initial_balances', methods=['GET'])
-@login_required
-def get_initial_balances():
-    cash = float(get_setting('current_cash', '0'))
-    bank = float(get_setting('current_bank', '0'))
-    return jsonify({'cash': cash, 'bank': bank})
-
-@app.route('/api/initial_balances', methods=['POST'])
-@login_required
-@role_required(['admin'])
-def set_initial_balances():
-    data = request.get_json()
-    cash = data.get('cash', 0)
-    bank = data.get('bank', 0)
-    update_setting('current_cash', cash)
-    update_setting('current_bank', bank)
-    return jsonify({'message': '保存成功'})
-
 # ---------- 程序入口 ----------
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # 生产环境请将 debug 设为 False
+    app.run(debug=False, host='0.0.0.0', port=5000)
