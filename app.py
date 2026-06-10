@@ -331,11 +331,14 @@ def add_cash_flow(amount, flow_type, account_type, related_id, note, created_by)
     conn.close()
 
 def get_payment_methods():
-    methods_str = get_setting('payment_methods', '["现金","银行转账"]')
+    methods_str = get_setting('payment_methods', '["现金","银行转账","微信","支付宝"]')
     try:
-        return json.loads(methods_str)
+        methods = json.loads(methods_str)
+        if not isinstance(methods, list) or len(methods) == 0:
+            return ["现金", "银行转账", "微信", "支付宝"]
+        return methods
     except:
-        return ["现金", "银行转账"]
+        return ["现金", "银行转账", "微信", "支付宝"]
 
 # ---------- 页面路由 ----------
 @app.route('/')
@@ -1584,14 +1587,23 @@ let customers=[];
 function syncActualAmount(){ let total=parseFloat(document.getElementById('cartTotal').innerText); let actual=parseFloat(document.getElementById('actualAmount').value); if(isNaN(actual)) actual=total; if(actual<0) actual=0; document.getElementById('actualAmount').value=actual.toFixed(2); }
 async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const search=document.getElementById('searchInput').value.toLowerCase(); const filtered=ps.filter(p=>p.name.toLowerCase().includes(search)); document.getElementById('productList').innerHTML=filtered.map(p=>`<div class="col-6 col-md-4 mb-3"><div class="card"><div class="card-body"><h6>${escapeHtml(p.name)}</h6><p>¥${p.price.toFixed(2)}<br>库存:${p.stock} ${p.stock<10?'<span class="low-stock">(低)</span>':''}</p><div class="input-group"><input type="number" id="qty_${p.id}" class="form-control" value="1" min="1" max="${p.stock}"><button class="btn btn-primary btn-sm" onclick="addToCart(${p.id})">加入</button></div></div></div></div>`).join(''); }
 async function loadCustomers(){ const resp=await fetch('/api/partners'); const all=await resp.json(); customers=all.filter(p=>p.type==='customer'); const select=document.getElementById('customerSelect'); select.innerHTML='<option value="">散客（不记录）</option>'+customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join(''); }
-async function loadPaymentMethods(){ 
-    const resp = await fetch('/api/payment_methods'); 
-    let methods = await resp.json(); 
-    if (!methods || methods.length === 0) {
-        methods = ["现金", "银行转账", "微信", "支付宝"];
+async function loadPaymentMethods(){
+    try {
+        const resp = await fetch('/api/payment_methods');
+        if (!resp.ok) {
+            throw new Error('API请求失败');
+        }
+        let methods = await resp.json();
+        if (!methods || !Array.isArray(methods) || methods.length === 0) {
+            methods = ["现金", "银行转账", "微信", "支付宝"];
+        }
+        const select = document.getElementById('paymentMethod');
+        select.innerHTML = methods.map(m => `<option value="${m}">${m}</option>`).join('');
+    } catch (error) {
+        console.error('加载支付方式失败:', error);
+        const select = document.getElementById('paymentMethod');
+        select.innerHTML = ["现金", "银行转账", "微信", "支付宝"].map(m => `<option value="${m}">${m}</option>`).join('');
     }
-    const select = document.getElementById('paymentMethod'); 
-    select.innerHTML = methods.map(m => `<option value="${m}">${m}</option>`).join(''); 
 }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 async function addToCart(pid){ let qty=parseInt(document.getElementById(`qty_${pid}`).value)||1; const resp=await fetch('/api/cart/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok){ loadCart(); showToast('添加成功','success'); }else{ const err=await resp.json(); showToast(err.error,'danger'); } }
