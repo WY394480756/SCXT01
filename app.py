@@ -17,7 +17,6 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = Flask(__name__)
-# 安全：从环境变量获取密钥，若无则使用默认（生产环境务必设置）
 app.secret_key = os.environ.get('SECRET_KEY', 'change-this-in-production')
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
@@ -222,7 +221,7 @@ def init_db():
         FOREIGN KEY (product_id) REFERENCES products (id)
     )''')
     
-    # 动态迁移：为 sales 和 purchases 增加 is_returned 列
+    # 动态迁移
     for tbl in ['sales', 'purchases']:
         try:
             c.execute(f"ALTER TABLE {tbl} ADD COLUMN is_returned INTEGER DEFAULT 0")
@@ -301,7 +300,8 @@ def role_required(allowed_roles):
     return decorator
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # 增加 timeout 避免 database is locked 错误
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn, conn.cursor()
 
@@ -549,7 +549,7 @@ def remove_from_cart():
 def clear_cart():
     session['cart'] = {}
     return jsonify({'message': '清空成功'})
-# ---------- 结算API ----------
+# ---------- 结算API（带重试机制）----------
 @app.route('/api/checkout', methods=['POST'])
 @login_required
 def checkout():
@@ -562,111 +562,118 @@ def checkout():
     if not cart:
         return jsonify({'error': '购物车为空'}), 400
     
-    conn, c = get_db()
-    try:
-        c.execute("BEGIN")
-        items_to_buy = []
-        total_amount = 0
-        for pid_str, qty in cart.items():
-            pid = int(pid_str)
-            c.execute("SELECT name, price, cost, stock FROM products WHERE id=?", (pid,))
-            row = c.fetchone()
-            if not row:
-                raise Exception(f"商品ID {pid} 不存在")
-            if row['stock'] < qty:
-                raise Exception(f"{row['name']} 库存不足")
-            subtotal = row['price'] * qty
-            total_amount += subtotal
-            items_to_buy.append({
-                'id': pid, 'name': row['name'], 'quantity': qty,
-                'price': row['price'], 'cost': row['cost']
-            })
-        
-        if actual_amount is None:
-            actual_amount = total_amount
-        else:
-            actual_amount = float(actual_amount)
-            if actual_amount < 0:
-                actual_amount = 0
-        
-        # 会员支付处理
-        if payment_method == 'member_card' and member_id:
-            c.execute("SELECT * FROM members WHERE id=?", (member_id,))
-            member = c.fetchone()
-            if not member:
-                raise Exception("会员不存在")
-            member = dict(member)
-            if member['card_type'] == 'stored_value':
-                if member['balance'] < actual_amount:
-                    raise Exception(f"储值卡余额不足，当前余额: {member['balance']}")
-                new_balance = member['balance'] - actual_amount
-                c.execute("UPDATE members SET balance = ? WHERE id = ?", (new_balance, member_id))
-                c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
-                          (member_id, 'consume', -actual_amount, f"消费 {actual_amount} 元"))
-            elif member['card_type'] == 'count_limited':
-                if member['remaining_counts'] <= 0:
-                    raise Exception("次卡剩余次数不足")
-                new_counts = member['remaining_counts'] - 1
-                c.execute("UPDATE members SET remaining_counts = ? WHERE id = ?", (new_counts, member_id))
-                c.execute("INSERT INTO member_transactions (member_id, transaction_type, counts_change, description) VALUES (?, ?, ?, ?)",
-                          (member_id, 'consume', -1, "消费1次"))
-            elif member['card_type'] == 'time_limited':
-                today_str = date.today().isoformat()
-                if member['valid_from'] and today_str < member['valid_from']:
-                    raise Exception("会员卡尚未生效")
-                if member['valid_to'] and today_str > member['valid_to']:
-                    raise Exception("会员卡已过期")
-                c.execute("INSERT INTO member_transactions (member_id, transaction_type, description) VALUES (?, ?, ?)",
-                          (member_id, 'consume', f"期限卡消费 {actual_amount} 元"))
-        
-        # 更新客户应收余额
-        if customer_id:
-            c.execute("SELECT type, current_balance FROM partners WHERE id=?", (customer_id,))
-            partner = c.fetchone()
-            if partner and partner['type'] == 'customer':
-                new_bal = partner['current_balance'] + actual_amount
-                c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, customer_id))
-        
-        # 销售主表
-        sale_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT INTO sales (sale_time, total_amount, member_id, partner_id, payment_method, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                  (sale_time, actual_amount, member_id, customer_id, payment_method, current_user.id))
-        sale_id = c.lastrowid
-        
-        for item in items_to_buy:
-            c.execute("INSERT INTO sale_items (sale_id, product_id, quantity, price_at_sale, cost_at_sale) VALUES (?, ?, ?, ?, ?)",
-                      (sale_id, item['id'], item['quantity'], item['price'], item['cost']))
-            c.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['quantity'], item['id']))
-        
-        if payment_method != 'member_card':
-            add_cash_flow(actual_amount, 'sales_income', 'cash', sale_id, f"销售单{sale_id}", current_user.id)
-        
-        conn.commit()
-        session['cart'] = {}
-        
-        ticket_data = {
-            'sale_id': sale_id,
-            'sale_time': sale_time,
-            'operator': current_user.username,
-            'member': None,
-            'customer': None,
-            'items': items_to_buy,
-            'total': total_amount,
-            'actual': actual_amount,
-            'payment_method': payment_method
-        }
-        if member_id:
-            ticket_data['member'] = member['name'] if 'member' in locals() else ''
-        if customer_id:
-            c.execute("SELECT name FROM partners WHERE id=?", (customer_id,))
-            cust = c.fetchone()
-            ticket_data['customer'] = cust['name'] if cust else ''
-        return jsonify({'message': '结算成功', 'sale_id': sale_id, 'total_amount': actual_amount, 'ticket': ticket_data})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': str(e)}), 400
-    finally:
-        conn.close()
+    max_retries = 3
+    for attempt in range(max_retries):
+        conn, c = get_db()
+        try:
+            c.execute("BEGIN")
+            items_to_buy = []
+            total_amount = 0
+            for pid_str, qty in cart.items():
+                pid = int(pid_str)
+                c.execute("SELECT name, price, cost, stock FROM products WHERE id=?", (pid,))
+                row = c.fetchone()
+                if not row:
+                    raise Exception(f"商品ID {pid} 不存在")
+                if row['stock'] < qty:
+                    raise Exception(f"{row['name']} 库存不足")
+                subtotal = row['price'] * qty
+                total_amount += subtotal
+                items_to_buy.append({
+                    'id': pid, 'name': row['name'], 'quantity': qty,
+                    'price': row['price'], 'cost': row['cost']
+                })
+            
+            if actual_amount is None:
+                actual_amount = total_amount
+            else:
+                actual_amount = float(actual_amount)
+                if actual_amount < 0:
+                    actual_amount = 0
+            
+            # 会员支付处理
+            if payment_method == 'member_card' and member_id:
+                c.execute("SELECT * FROM members WHERE id=?", (member_id,))
+                member = c.fetchone()
+                if not member:
+                    raise Exception("会员不存在")
+                member = dict(member)
+                if member['card_type'] == 'stored_value':
+                    if member['balance'] < actual_amount:
+                        raise Exception(f"储值卡余额不足，当前余额: {member['balance']}")
+                    new_balance = member['balance'] - actual_amount
+                    c.execute("UPDATE members SET balance = ? WHERE id = ?", (new_balance, member_id))
+                    c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
+                              (member_id, 'consume', -actual_amount, f"消费 {actual_amount} 元"))
+                elif member['card_type'] == 'count_limited':
+                    if member['remaining_counts'] <= 0:
+                        raise Exception("次卡剩余次数不足")
+                    new_counts = member['remaining_counts'] - 1
+                    c.execute("UPDATE members SET remaining_counts = ? WHERE id = ?", (new_counts, member_id))
+                    c.execute("INSERT INTO member_transactions (member_id, transaction_type, counts_change, description) VALUES (?, ?, ?, ?)",
+                              (member_id, 'consume', -1, "消费1次"))
+                elif member['card_type'] == 'time_limited':
+                    today_str = date.today().isoformat()
+                    if member['valid_from'] and today_str < member['valid_from']:
+                        raise Exception("会员卡尚未生效")
+                    if member['valid_to'] and today_str > member['valid_to']:
+                        raise Exception("会员卡已过期")
+                    c.execute("INSERT INTO member_transactions (member_id, transaction_type, description) VALUES (?, ?, ?)",
+                              (member_id, 'consume', f"期限卡消费 {actual_amount} 元"))
+            
+            # 更新客户应收余额
+            if customer_id:
+                c.execute("SELECT type, current_balance FROM partners WHERE id=?", (customer_id,))
+                partner = c.fetchone()
+                if partner and partner['type'] == 'customer':
+                    new_bal = partner['current_balance'] + actual_amount
+                    c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, customer_id))
+            
+            # 销售主表
+            sale_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("INSERT INTO sales (sale_time, total_amount, member_id, partner_id, payment_method, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                      (sale_time, actual_amount, member_id, customer_id, payment_method, current_user.id))
+            sale_id = c.lastrowid
+            
+            for item in items_to_buy:
+                c.execute("INSERT INTO sale_items (sale_id, product_id, quantity, price_at_sale, cost_at_sale) VALUES (?, ?, ?, ?, ?)",
+                          (sale_id, item['id'], item['quantity'], item['price'], item['cost']))
+                c.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['quantity'], item['id']))
+            
+            if payment_method != 'member_card':
+                add_cash_flow(actual_amount, 'sales_income', 'cash', sale_id, f"销售单{sale_id}", current_user.id)
+            
+            conn.commit()
+            session['cart'] = {}
+            
+            ticket_data = {
+                'sale_id': sale_id,
+                'sale_time': sale_time,
+                'operator': current_user.username,
+                'member': None,
+                'customer': None,
+                'items': items_to_buy,
+                'total': total_amount,
+                'actual': actual_amount,
+                'payment_method': payment_method
+            }
+            if member_id:
+                ticket_data['member'] = member['name'] if 'member' in locals() else ''
+            if customer_id:
+                c.execute("SELECT name FROM partners WHERE id=?", (customer_id,))
+                cust = c.fetchone()
+                ticket_data['customer'] = cust['name'] if cust else ''
+            return jsonify({'message': '结算成功', 'sale_id': sale_id, 'total_amount': actual_amount, 'ticket': ticket_data})
+        except Exception as e:
+            conn.rollback()
+            if attempt < max_retries - 1 and "database is locked" in str(e):
+                import time
+                time.sleep(0.5)
+                continue
+            return jsonify({'error': str(e)}), 400
+        finally:
+            conn.close()
+    return jsonify({'error': '系统繁忙，请稍后重试'}), 503
 # ---------- 会员API ----------
 @app.route('/api/members', methods=['GET'])
 @login_required
@@ -1028,7 +1035,7 @@ def get_purchases():
     conn.close()
     return jsonify(rows)
 
-# ---------- 销售退货API（修正版：自动判断原支付方式，支持次卡退次数）----------
+# ---------- 销售退货API ----------
 @app.route('/api/sales/<int:sale_id>/returnable_items', methods=['GET'])
 @login_required
 def get_returnable_items(sale_id):
@@ -1062,7 +1069,6 @@ def process_sales_return():
     items = data.get('items', [])
     refund_amount = data.get('refund_amount')
     reason = data.get('reason', '')
-    # 注意：不再需要前端传入 payment_method，后端自动根据原销售单处理
     if not sale_id or not items:
         return jsonify({'error': '参数错误'}), 400
     conn, c = get_db()
@@ -1117,23 +1123,19 @@ def process_sales_return():
                 c.execute("INSERT INTO member_transactions (member_id, transaction_type, amount, description) VALUES (?, ?, ?, ?)",
                           (sale['member_id'], 'refund', refund_amount, f"销售退货退款，原单{sale_id}"))
             elif member['card_type'] == 'count_limited':
-                # 次卡退货：恢复1次（根据原消费逻辑，每次销售扣1次）
                 new_counts = member['remaining_counts'] + 1
                 c.execute("UPDATE members SET remaining_counts = ? WHERE id = ?", (new_counts, sale['member_id']))
                 c.execute("INSERT INTO member_transactions (member_id, transaction_type, counts_change, description) VALUES (?, ?, ?, ?)",
                           (sale['member_id'], 'refund', 1, f"销售退货恢复次数，原单{sale_id}"))
-            # 期限卡无需处理
         else:
-            # 非会员卡支付，退现金
             add_cash_flow(-refund_amount, 'sales_return', 'cash', sale_id, f"销售退货单{sale_id}", current_user.id)
-        # 更新客户应收余额（减少欠款）
+        # 更新客户应收余额
         if sale['partner_id']:
             c.execute("SELECT current_balance FROM partners WHERE id=?", (sale['partner_id'],))
             partner = c.fetchone()
             if partner:
                 new_bal = partner['current_balance'] - refund_amount
                 c.execute("UPDATE partners SET current_balance=? WHERE id=?", (new_bal, sale['partner_id']))
-        # 插入退货记录
         return_time = datetime.now().isoformat()
         c.execute("""INSERT INTO sales_returns (return_time, original_sale_id, total_amount, refund_amount, 
                      member_id, partner_id, payment_method, reason, created_by)
@@ -1231,7 +1233,7 @@ def process_purchase_return():
             c.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (it['quantity'], it['product_id']))
         # 退款（增加现金流）
         add_cash_flow(refund_amount, 'purchase_return', payment_method, purchase_id, f"采购退货单{purchase_id}", current_user.id)
-        # 更新供应商应付余额（增加，因为退货减少了欠款）
+        # 更新供应商应付余额
         if purchase['partner_id']:
             c.execute("SELECT current_balance FROM partners WHERE id=?", (purchase['partner_id'],))
             partner = c.fetchone()
@@ -1298,24 +1300,20 @@ def get_sale_detail(sid):
     conn.close()
     return jsonify(sale)
 
-# ---------- 财务报表（修正：扣除退货）----------
+# ---------- 财务报表（扣除退货）----------
 @app.route('/api/financial_report')
 @login_required
 @role_required(['admin'])
 def financial_report():
     conn,c = get_db()
-    # 销售收入 = 销售总额 - 销售退货总额（退款金额）
     c.execute("SELECT SUM(total_amount) as sales_total FROM sales")
     sales_total = c.fetchone()[0] or 0
     c.execute("SELECT SUM(refund_amount) as returns_total FROM sales_returns")
     returns_total = c.fetchone()[0] or 0
     total_sales = sales_total - returns_total
     
-    # 销售成本 = 原销售成本 - 退货商品的成本（按原销售时的成本）
-    # 原销售成本
     c.execute("SELECT SUM(quantity * cost_at_sale) as cost_total FROM sale_items")
     cost_total = c.fetchone()[0] or 0
-    # 退货成本：从 sales_return_items 中获取退货数量对应的原成本（从原 sale_items 关联）
     c.execute('''SELECT SUM(sri.quantity * si.cost_at_sale) as return_cost
                  FROM sales_return_items sri
                  JOIN sale_items si ON si.sale_id = (SELECT original_sale_id FROM sales_returns WHERE id = sri.return_id)
@@ -1323,14 +1321,12 @@ def financial_report():
     return_cost = c.fetchone()[0] or 0
     total_cost = cost_total - return_cost
     
-    # 采购总额 = 原采购总额 - 采购退货总额
     c.execute("SELECT SUM(total_amount) as purchase_total FROM purchases")
     purchase_total = c.fetchone()[0] or 0
     c.execute("SELECT SUM(refund_amount) as purchase_return_total FROM purchase_returns")
     purchase_return_total = c.fetchone()[0] or 0
     total_purchases = purchase_total - purchase_return_total
     
-    # 当前库存价值（按平均成本，已自动更新）
     c.execute("SELECT SUM(stock*cost) as inv_value FROM products")
     inv_val = c.fetchone()[0] or 0
     c.execute("SELECT SUM(balance) as member_bal FROM members WHERE card_type='stored_value'")
@@ -1588,7 +1584,15 @@ let customers=[];
 function syncActualAmount(){ let total=parseFloat(document.getElementById('cartTotal').innerText); let actual=parseFloat(document.getElementById('actualAmount').value); if(isNaN(actual)) actual=total; if(actual<0) actual=0; document.getElementById('actualAmount').value=actual.toFixed(2); }
 async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const search=document.getElementById('searchInput').value.toLowerCase(); const filtered=ps.filter(p=>p.name.toLowerCase().includes(search)); document.getElementById('productList').innerHTML=filtered.map(p=>`<div class="col-6 col-md-4 mb-3"><div class="card"><div class="card-body"><h6>${escapeHtml(p.name)}</h6><p>¥${p.price.toFixed(2)}<br>库存:${p.stock} ${p.stock<10?'<span class="low-stock">(低)</span>':''}</p><div class="input-group"><input type="number" id="qty_${p.id}" class="form-control" value="1" min="1" max="${p.stock}"><button class="btn btn-primary btn-sm" onclick="addToCart(${p.id})">加入</button></div></div></div></div>`).join(''); }
 async function loadCustomers(){ const resp=await fetch('/api/partners'); const all=await resp.json(); customers=all.filter(p=>p.type==='customer'); const select=document.getElementById('customerSelect'); select.innerHTML='<option value="">散客（不记录）</option>'+customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join(''); }
-async function loadPaymentMethods(){ const resp=await fetch('/api/payment_methods'); const methods=await resp.json(); const select=document.getElementById('paymentMethod'); select.innerHTML=methods.map(m=>`<option value="${m}">${m}</option>`).join(''); }
+async function loadPaymentMethods(){ 
+    const resp = await fetch('/api/payment_methods'); 
+    let methods = await resp.json(); 
+    if (!methods || methods.length === 0) {
+        methods = ["现金", "银行转账", "微信", "支付宝"];
+    }
+    const select = document.getElementById('paymentMethod'); 
+    select.innerHTML = methods.map(m => `<option value="${m}">${m}</option>`).join(''); 
+}
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 async function addToCart(pid){ let qty=parseInt(document.getElementById(`qty_${pid}`).value)||1; const resp=await fetch('/api/cart/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,quantity:qty})}); if(resp.ok){ loadCart(); showToast('添加成功','success'); }else{ const err=await resp.json(); showToast(err.error,'danger'); } }
 async function loadCart(){ const resp=await fetch('/api/cart'); const data=await resp.json(); const cartDiv=document.getElementById('cartItems'); if(data.items.length===0){ cartDiv.innerHTML='<p class="text-muted">购物车为空</p>'; document.getElementById('cartTotal').innerText='0.00'; document.getElementById('actualAmount').value='0.00'; return; } cartDiv.innerHTML=data.items.map(it=>`<div class="cart-item d-flex justify-content-between"><div><strong>${escapeHtml(it.name)}</strong><br>¥${it.price} × ${it.quantity} = ¥${it.subtotal}</div><div><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity-1})">-</button><span class="mx-1">${it.quantity}</span><button class="btn btn-sm btn-outline-secondary" onclick="updateCart(${it.product_id},${it.quantity+1})">+</button><button class="btn btn-sm btn-danger ms-2" onclick="removeFromCart(${it.product_id})">删</button></div></div>`).join(''); document.getElementById('cartTotal').innerText=data.total.toFixed(2); document.getElementById('actualAmount').value=data.total.toFixed(2); }
@@ -1597,7 +1601,7 @@ async function removeFromCart(pid){ await fetch('/api/cart/remove',{method:'DELE
 document.getElementById('clearCartBtn').onclick=async()=>{ await fetch('/api/cart/clear',{method:'DELETE'}); loadCart(); };
 document.getElementById('paymentMethod').onchange=function(){ document.getElementById('memberSelectDiv').style.display=this.value==='member_card'?'block':'none'; };
 document.getElementById('checkoutBtn').onclick=async()=>{ let member_id=null, pm=document.getElementById('paymentMethod').value; if(pm==='member_card'){ member_id=parseInt(document.getElementById('memberId').value); if(isNaN(member_id)){ showToast('请输入会员ID','danger'); return; } } const customer_id=document.getElementById('customerSelect').value||null; const actual_amount=parseFloat(document.getElementById('actualAmount').value)||0; const resp=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment_method:pm,member_id:member_id,customer_id:customer_id,actual_amount:actual_amount})}); const result=await resp.json(); if(resp.ok){ showToast(`结算成功！金额:¥${result.total_amount}`,'success'); loadCart(); loadProducts(); if(result.ticket) printTicket(result.ticket); }else{ showToast(result.error,'danger'); } };
-function printTicket(ticket){ let html=`<html><head><title>销售小票</title><style>body{font-family:monospace;padding:20px}table{width:100%}</style></head><body><h3>商超收银系统</h3><p>单号:${ticket.sale_id}<br>时间:${ticket.sale_time}<br>操作员:${ticket.operator}<br>会员:${ticket.member||'散客'}<br>客户:${ticket.customer||''}</p><div class="table-responsive"><table border="1" cellpadding="4"><tr><th>商品</th><th>单价</th><th>数量</th><th>小计</th></tr>${ticket.items.map(i=>`<tr><td>${escapeHtml(i.name)}</td><td>¥${i.price.toFixed(2)}</td><td>${i.quantity}</td><td>¥${(i.price*i.quantity).toFixed(2)}</td></tr>`).join('')}<tr><td colspan="3" align="right"><strong>原价</strong></td><td>¥${ticket.total.toFixed(2)}<\/td><\/tr><tr><td colspan="3" align="right"><strong>实收<\/strong><\/td><td>¥${ticket.actual.toFixed(2)}<\/td><\/tr><\/table><\/div><p>支付方式:${ticket.payment_method}<\/p><button onclick="window.print()">打印<\/button><script>setTimeout(function(){window.print();window.close()},500)<\/script><\/body><\/html>`; let w=window.open('','_blank'); w.document.write(html); w.document.close(); }
+function printTicket(ticket){ let html=`<html><head><title>销售小票</title><style>body{font-family:monospace;padding:20px}table{width:100%}</style></head><body><h3>商超收银系统</h3><p>单号:${ticket.sale_id}<br>时间:${ticket.sale_time}<br>操作员:${ticket.operator}<br>会员:${ticket.member||'散客'}<br>客户:${ticket.customer||''}</p><div class="table-responsive"><table border="1" cellpadding="4"><tr><th>商品</th><th>单价</th><th>数量</th><th>小计</th><tr>${ticket.items.map(i=>`<tr><td>${escapeHtml(i.name)}</td><td>¥${i.price.toFixed(2)}</td><td>${i.quantity}</td><td>¥${(i.price*i.quantity).toFixed(2)}</td></tr>`).join('')}<tr><td colspan="3" align="right"><strong>原价</strong></td><td>¥${ticket.total.toFixed(2)}<\/td><\/tr><tr><td colspan="3" align="right"><strong>实收<\/strong><\/td><td>¥${ticket.actual.toFixed(2)}<\/td><\/tr><\/table><\/div><p>支付方式:${ticket.payment_method}<\/p><button onclick="window.print()">打印<\/button><script>setTimeout(function(){window.print();window.close()},500)<\/script><\/body><\/html>`; let w=window.open('','_blank'); w.document.write(html); w.document.close(); }
 document.getElementById('searchInput').addEventListener('input',loadProducts);
 function showToast(msg,type){ const d=document.createElement('div'); d.className=`alert alert-${type} alert-dismissible fade show position-fixed top-0 end-0 m-3`; d.style.zIndex=1050; d.innerHTML=`${msg}<button type="button" class="btn-close" data-bs-dismiss="alert"></button>`; document.body.appendChild(d); setTimeout(()=>d.remove(),2000); }
 loadProducts(); loadCart(); loadCustomers(); loadPaymentMethods();
@@ -1622,7 +1626,7 @@ USERADMIN_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link active" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>操作员管理</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addUserModal">+ 新增操作员</button></div>
-<div class="table-responsive"><table class="table table-bordered mt-3"><thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>创建时间</th><th>操作</th><tr></thead><tbody id="userTableBody"></tbody></table></div></div>
+<div class="table-responsive"><table class="table table-bordered mt-3"><thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="userTableBody"></tbody></table></div></div>
 <div class="modal fade" id="addUserModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>新增操作员</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div><label>用户名</label><input id="newUsername" class="form-control"></div><div><label>姓名</label><input id="newFullname" class="form-control"></div><div><label>密码</label><input id="newPassword" type="password" class="form-control"></div><div><label>角色</label><select id="newRole" class="form-select"><option value="operator">操作员</option><option value="admin">管理员</option></select></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="submitAddUser">保存</button></div></div></div></div>
 <div class="modal fade" id="resetPwModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>重置密码</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="resetUserId"><div><label>新密码</label><input id="resetPassword" type="password" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-warning" id="submitResetPw">确认重置</button></div></div></div></div>
 <script>
@@ -1645,10 +1649,10 @@ INVENTORY_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link active" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button><button class="btn btn-outline-light btn-sm" onclick="exportInventory()">📎 导出 CSV</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>商品库存</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#productModal" onclick="openAddModal()">+ 新增商品</button></div>
-<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>售价</th><th>成本</th><th>库存</th><th>状态</th><th>操作</th></tr></thead><tbody id="productTableBody"></tbody></tr></div></div>
+<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>售价</th><th>成本</th><th>库存</th><th>状态</th><th>操作</th></tr></thead><tbody id="productTableBody"></tbody></td></div></div>
 <div class="modal fade" id="productModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 id="modalTitle">商品</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="editId"><div><label>名称</label><input id="prodName" class="form-control"></div><div><label>售价</label><input id="prodPrice" type="number" step="0.01" class="form-control"></div><div><label>成本</label><input id="prodCost" type="number" step="0.01" class="form-control"></div><div><label>库存</label><input id="prodStock" type="number" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveProductBtn">保存</button></div></div></div></div>
 <script>
-async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const tbody=document.getElementById('productTableBody'); tbody.innerHTML=ps.map(p=>`<tr><td>${p.id}</td><td>${escapeHtml(p.name)}</td><td>${p.price.toFixed(2)}</td><td>${p.cost.toFixed(2)}</td><td>${p.stock}</td><td>${p.stock<10?'<span class="badge bg-warning">低库存</span>':'<span class="badge bg-success">充足</span>'}</td><td><button class="btn btn-sm btn-warning" onclick="openEditModal(${p.id},'${escapeHtml(p.name)}',${p.price},${p.cost},${p.stock})">编辑</button> <button class="btn btn-sm btn-danger" onclick="deleteProduct(${p.id})">删除</button></td></table>`).join(''); }
+async function loadProducts(){ const resp=await fetch('/api/products'); const ps=await resp.json(); const tbody=document.getElementById('productTableBody'); tbody.innerHTML=ps.map(p=>`<tr><td>${p.id}</td><td>${escapeHtml(p.name)}</td><td>${p.price.toFixed(2)}</td><td>${p.cost.toFixed(2)}</td><td>${p.stock}</td><td>${p.stock<10?'<span class="badge bg-warning">低库存</span>':'<span class="badge bg-success">充足</span>'}</td><td><button class="btn btn-sm btn-warning" onclick="openEditModal(${p.id},'${escapeHtml(p.name)}',${p.price},${p.cost},${p.stock})">编辑</button> <button class="btn btn-sm btn-danger" onclick="deleteProduct(${p.id})">删除</button></td></tr>`).join(''); }
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 function openAddModal(){ document.getElementById('editId').value=''; document.getElementById('prodName').value=''; document.getElementById('prodPrice').value=''; document.getElementById('prodCost').value=''; document.getElementById('prodStock').value=''; new bootstrap.Modal(document.getElementById('productModal')).show(); }
 function openEditModal(id,name,price,cost,stock){ document.getElementById('editId').value=id; document.getElementById('prodName').value=name; document.getElementById('prodPrice').value=price; document.getElementById('prodCost').value=cost; document.getElementById('prodStock').value=stock; new bootstrap.Modal(document.getElementById('productModal')).show(); }
@@ -1752,7 +1756,7 @@ MEMBERS_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link active" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button><button class="btn btn-outline-light btn-sm" onclick="exportMembers()">📎 导出 CSV</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>会员列表</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#memberModal" onclick="openAddModal()">+ 新增会员</button></div>
-<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>姓名</th><th>手机</th><th>卡类型</th><th>余额/次数</th><th>有效期</th><th>操作</th></tr></thead><tbody id="memberTableBody"></tbody></tr></div></div>
+<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>姓名</th><th>手机</th><th>卡类型</th><th>余额/次数</th><th>有效期</th><th>操作</th></tr></thead><tbody id="memberTableBody"></tbody></table></div></div>
 <div class="modal fade" id="memberModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>会员</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="editMemberId"><div><label>姓名</label><input id="memberName" class="form-control"></div><div><label>手机</label><input id="memberPhone" class="form-control"></div><div><label>卡类型</label><select id="cardType" class="form-select"><option value="stored_value">储值卡</option><option value="count_limited">次卡</option><option value="time_limited">期限卡</option></select></div><div id="balanceDiv"><label>初始余额</label><input id="initBalance" type="number" step="0.01" class="form-control" value="0"></div><div id="countsDiv" style="display:none"><label>初始次数</label><input id="initCounts" type="number" class="form-control" value="0"></div><div id="validDiv" style="display:none"><label>生效日期</label><input id="validFrom" type="date" class="form-control"><label>失效日期</label><input id="validTo" type="date" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveMemberBtn">保存</button></div></div></div></div>
 <div class="modal fade" id="rechargeModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>会员充值</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="rechargeMemberId"><p id="rechargeMemberInfo"></p><div id="rechargeAmountDiv"><label>充值金额</label><input id="rechargeAmount" type="number" step="0.01" class="form-control" value="0"></div><div id="rechargeCountsDiv" style="display:none"><label>充值次数</label><input id="rechargeCounts" type="number" class="form-control" value="0"></div></div><div class="modal-footer"><button class="btn btn-primary" id="doRechargeBtn">确认充值</button></div></div></div></div>
 <div class="modal fade" id="transactionsModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>会员交易记录</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="table-responsive"><table class="table table-sm" id="transactionsTable"><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>次数变化</th><th>描述</th><th>操作</th></tr></thead><tbody></tbody></table></div></div></div></div></div>
@@ -1823,7 +1827,7 @@ function attachEvents(idx){ const sel=document.querySelector(`#row_${idx} .produ
 function escapeHtml(s){ return s.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
 document.getElementById('partnerSelect').addEventListener('change',function(){ const selected=this.options[this.selectedIndex]; if(selected.value){ document.getElementById('supplier').value=selected.getAttribute('data-name'); } });
 document.getElementById('submitPurchase').onclick=async()=>{ const items=[]; const rows=document.querySelectorAll('#purchaseItemsBody tr'); for(let row of rows){ const sel=row.querySelector('.product-select'); const pid=sel.value; if(!pid) continue; const qty=parseFloat(row.querySelector('.qty').value); const unitCost=parseFloat(row.querySelector('.price').value); if(isNaN(qty)||isNaN(unitCost)||qty<=0||unitCost<0){ alert('请正确填写数量与进价'); return; } items.push({product_id:parseInt(pid),quantity:qty,unit_cost:unitCost}); } if(items.length===0){ alert('请添加至少一种商品'); return; } let partner_id=document.getElementById('partnerSelect').value; if(partner_id) partner_id=parseInt(partner_id); const supplier=document.getElementById('supplier').value; const payment_method=document.getElementById('payMethod').value; const resp=await fetch('/api/purchases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,partner_id,items,payment_method})}); const result=await resp.json(); if(resp.ok){ alert('采购入库成功！'); location.reload(); }else{ alert(result.error); } };
-async function loadPurchaseHistory(){ const resp=await fetch('/api/purchases'); const purchases=await resp.json(); const tbody=document.getElementById('purchaseHistoryBody'); tbody.innerHTML=purchases.map(p=>`<table><td>${p.id}</td><td>${p.purchase_time}</td><td>${escapeHtml(p.supplier||'')}</td><td>${p.total_amount.toFixed(2)}</td><td>${p.payment_method}</td><td>${p.is_returned?'已退货':'正常'}</td><td>${p.is_returned?'':`<button class="btn btn-sm btn-warning" onclick="showPurchaseReturn(${p.id})">退货</button>`}</td>`).join(''); }
+async function loadPurchaseHistory(){ const resp=await fetch('/api/purchases'); const purchases=await resp.json(); const tbody=document.getElementById('purchaseHistoryBody'); tbody.innerHTML=purchases.map(p=>`<tr><td>${p.id}</td><td>${p.purchase_time}</td><td>${escapeHtml(p.supplier||'')}</td><td>${p.total_amount.toFixed(2)}</td><td>${p.payment_method}</td><td>${p.is_returned?'已退货':'正常'}</td><td>${p.is_returned?'':`<button class="btn btn-sm btn-warning" onclick="showPurchaseReturn(${p.id})">退货</button>`}</td></tr>`).join(''); }
 async function showPurchaseReturn(purchaseId){
     currentReturnPurchaseId = purchaseId;
     document.getElementById('returnPurchaseId').innerText = purchaseId;
@@ -1900,7 +1904,7 @@ PARTNERS_HTML = '''
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link active" href="/partners">往来单位</a><a class="nav-link" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
 <div class="container mt-4"><div class="d-flex justify-content-between"><h3>往来单位（供应商/客户）</h3><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#partnerModal" onclick="openAddModal()">+ 新增</button></div>
-<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>类型</th><th>上级</th><th>联系人</th><th>电话</th><th>期初余额</th><th>当前余额</th><th>操作</th></tr></thead><tbody id="partnerTableBody"></tbody></table></div></div>
+<div class="table-responsive"><table class="table table-bordered"><thead><tr><th>ID</th><th>名称</th><th>类型</th><th>上级</th><th>联系人</th><th>电话</th><th>期初余额</th><th>当前余额</th><th>操作</th></tr></thead><tbody id="partnerTableBody"></tbody></tr></div></div>
 <div class="modal fade" id="partnerModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 id="modalTitle">往来单位</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="editId"><div><label>名称</label><input id="name" class="form-control"></div><div><label>类型</label><select id="type" class="form-select"><option value="customer">客户</option><option value="supplier">供应商</option></select></div><div><label>上级单位</label><select id="parentId" class="form-select"><option value="">无（顶级）</option></select></div><div><label>联系人</label><input id="contact" class="form-control"></div><div><label>电话</label><input id="phone" class="form-control"></div><div><label>地址</label><input id="address" class="form-control"></div><div><label>期初余额（元，客户为正欠款，供应商为负欠款）</label><input id="opening" type="number" step="0.01" class="form-control" value="0"></div><div><label>备注</label><input id="notes" class="form-control"></div></div><div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" id="saveBtn">保存</button></div></div></div></div>
 <script>
 let allPartners=[];
@@ -1925,13 +1929,38 @@ FINANCE_HTML = '''
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>财务期初</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
 <body>
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark"><div class="container"><a class="navbar-brand" href="/pos">商超系统</a><div class="navbar-nav"><a class="nav-link" href="/pos">收银台</a><a class="nav-link" href="/inventory">库存管理</a><a class="nav-link" href="/sales">销售记录</a><a class="nav-link" href="/members">会员管理</a><a class="nav-link" href="/purchase">采购入库</a><a class="nav-link" href="/partners">往来单位</a><a class="nav-link active" href="/finance">财务期初</a><a class="nav-link" href="/backup">数据备份</a><a class="nav-link" href="/useradmin">用户管理</a><a class="nav-link" href="/logout">退出</a></div><div class="navbar-nav ms-auto"><button class="btn btn-outline-light btn-sm me-2" onclick="window.print()">🖨️ 打印本页</button></div></div></nav>
-<div class="container mt-4"><div class="row"><div class="col-md-6"><div class="card"><div class="card-body"><h5>期初余额设置</h5><div><label>现金</label><input id="cash" type="number" step="0.01" class="form-control"></div><div><label>银行存款</label><input id="bank" type="number" step="0.01" class="form-control"></div><button id="saveInitBtn" class="btn btn-primary mt-2">保存期初</button></div></div><div class="card mt-3"><div class="card-body"><h5>支付方式配置</h5><div><label>支付方式（英文逗号分隔）</label><input id="payMethodsInput" class="form-control" placeholder="现金,银行转账,微信,支付宝"></div><button id="savePayMethodsBtn" class="btn btn-primary mt-2">保存支付方式</button></div></div></div><div class="col-md-6"><div class="card"><div class="card-body"><h5>财务报表</h5><p>销售收入: ¥<span id="totalSales">0</span></p><p>销售成本: ¥<span id="totalCost">0</span></p><p>毛利: ¥<span id="grossProfit">0</span></p><p>采购总额: ¥<span id="purchasesTotal">0</span></p><hr><p>现金余额: ¥<span id="balanceCash">0</span></p><p>银行余额: ¥<span id="balanceBank">0</span></p><p>库存价值: ¥<span id="balanceInventory">0</span></p><p>总资产: ¥<span id="totalAssets">0</span></p><p>会员预收款: ¥<span id="liability">0</span></p><p>所有者权益: ¥<span id="equity">0</span></p></div></div></div></div></div>
+<div class="container mt-4"><div class="row"><div class="col-md-6"><div class="card"><div class="card-body"><h5>期初余额设置</h5><div><label>现金</label><input id="cash" type="number" step="0.01" class="form-control"></div><div><label>银行存款</label><input id="bank" type="number" step="0.01" class="form-control"></div><button id="saveInitBtn" class="btn btn-primary mt-2">保存期初</button></div></div><div class="card mt-3"><div class="card-body"><h5>支付方式配置</h5><div><label>支付方式（英文逗号分隔）</label><input id="payMethodsInput" class="form-control" placeholder="现金,银行转账,微信,支付宝"></div><button id="savePayMethodsBtn" class="btn btn-primary mt-2">保存支付方式</button><div id="payMethodsMsg" class="small text-muted mt-1"></div></div></div></div><div class="col-md-6"><div class="card"><div class="card-body"><h5>财务报表</h5><p>销售收入: ¥<span id="totalSales">0</span></p><p>销售成本: ¥<span id="totalCost">0</span></p><p>毛利: ¥<span id="grossProfit">0</span></p><p>采购总额: ¥<span id="purchasesTotal">0</span></p><hr><p>现金余额: ¥<span id="balanceCash">0</span></p><p>银行余额: ¥<span id="balanceBank">0</span></p><p>库存价值: ¥<span id="balanceInventory">0</span></p><p>总资产: ¥<span id="totalAssets">0</span></p><p>会员预收款: ¥<span id="liability">0</span></p><p>所有者权益: ¥<span id="equity">0</span></p></div></div></div></div></div>
 <script>
 async function loadInitial(){ const resp=await fetch('/api/initial_balances'); const data=await resp.json(); document.getElementById('cash').value=data.cash; document.getElementById('bank').value=data.bank; }
 async function loadReport(){ const resp=await fetch('/api/financial_report'); const data=await resp.json(); document.getElementById('totalSales').innerText=data.income_statement.total_sales; document.getElementById('totalCost').innerText=data.income_statement.total_cost; document.getElementById('grossProfit').innerText=data.income_statement.gross_profit; document.getElementById('purchasesTotal').innerText=data.purchases_total; document.getElementById('balanceCash').innerText=data.balance_sheet.cash; document.getElementById('balanceBank').innerText=data.balance_sheet.bank; document.getElementById('balanceInventory').innerText=data.balance_sheet.inventory; document.getElementById('totalAssets').innerText=data.balance_sheet.total_assets; document.getElementById('liability').innerText=data.balance_sheet.member_liability; document.getElementById('equity').innerText=data.balance_sheet.equity; }
 document.getElementById('saveInitBtn').onclick=async()=>{ const cash=parseFloat(document.getElementById('cash').value)||0; const bank=parseFloat(document.getElementById('bank').value)||0; const resp=await fetch('/api/initial_balances',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cash,bank})}); if(resp.ok){ alert('保存成功'); loadReport(); }else alert('保存失败'); };
-async function loadPayMethods(){ const resp=await fetch('/api/payment_methods'); const methods=await resp.json(); document.getElementById('payMethodsInput').value=methods.join(','); }
-document.getElementById('savePayMethodsBtn').onclick=async()=>{ const val=document.getElementById('payMethodsInput').value; const methods=val.split(',').map(s=>s.trim()).filter(s=>s); const resp=await fetch('/api/payment_methods',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({methods})}); const result=await resp.json(); alert(result.message||result.error); if(resp.ok) loadPayMethods(); };
+async function loadPayMethods(){ 
+    const resp = await fetch('/api/payment_methods'); 
+    const methods = await resp.json(); 
+    document.getElementById('payMethodsInput').value = methods.join(','); 
+}
+document.getElementById('savePayMethodsBtn').onclick=async()=>{ 
+    const val = document.getElementById('payMethodsInput').value; 
+    const methods = val.split(',').map(s=>s.trim()).filter(s=>s); 
+    if (methods.length === 0) { 
+        document.getElementById('payMethodsMsg').innerHTML = '<span class="text-danger">至少保留一种支付方式</span>';
+        return; 
+    }
+    const resp = await fetch('/api/payment_methods', {
+        method: 'POST', 
+        headers: {'Content-Type': 'application/json'}, 
+        body: JSON.stringify({methods: methods})
+    }); 
+    const result = await resp.json(); 
+    if (resp.ok) { 
+        alert('保存成功'); 
+        document.getElementById('payMethodsMsg').innerHTML = '<span class="text-success">已更新</span>';
+        loadPayMethods(); 
+    } else { 
+        alert('保存失败：' + result.error); 
+        document.getElementById('payMethodsMsg').innerHTML = '<span class="text-danger">保存失败</span>';
+    } 
+};
 loadInitial(); loadReport(); loadPayMethods();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
